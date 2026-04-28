@@ -1,3 +1,4 @@
 img/
 Report/
 .DS_Store
+__pycache__/
