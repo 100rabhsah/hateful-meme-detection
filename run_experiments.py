@@ -319,11 +319,11 @@ config = ExperimentConfig(
         learning_rate=2e-5,
         weight_decay=0.01,
         num_epochs=5,
-        train_batch_size=32,
-        val_batch_size=8,
-        test_batch_size=16,
+        train_batch_size=64,      # A100: safe at 64 (use 32 for T4)
+        val_batch_size=64,        # A100: larger = faster eval
+        test_batch_size=64,       # A100: larger = faster eval
         random_seed=42,
-        num_workers=0,        # 0 for Colab/Kaggle (avoids multiprocessing issues)
+        num_workers=2,            # Colab Pro handles 2 workers fine
         use_class_weights=False,
         use_augmented_data=exp["augmented"],
         num_kfolds=exp["kfold"],
