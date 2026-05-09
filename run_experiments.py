@@ -121,33 +121,60 @@ def setup_colab():
             project_root = "/content/hateful-meme-detection"
 
     # ── 4. Locate data ─────────────────────────────────────────────────
-    # Check common Colab data locations (ordered by priority)
-    data_candidates = [
-        # Primary: user's actual Drive data folder
+    # IMPORTANT: Google Drive FUSE I/O is very slow for random image reads.
+    # We copy data to the local SSD (/content/) first for ~10-50x faster I/O.
+
+    drive_data_candidates = [
         "/content/drive/MyDrive/hateful-memes-data",
-        # Data inside project
-        project_root,
-        # Other possible Drive locations
         "/content/drive/MyDrive/hateful_memes",
         "/content/drive/MyDrive/hateful_memes_data",
         "/content/drive/MyDrive/hateful_meme_detection",
         "/content/drive/MyDrive/datasets/hateful_memes",
     ]
 
-    data_root = None
-    for candidate in data_candidates:
-        # Check for JSONL files or img/ folder
-        has_json = os.path.exists(os.path.join(candidate, "JSON Files", "train.jsonl")) or \
-                   os.path.exists(os.path.join(candidate, "train.jsonl"))
-        has_img = os.path.exists(os.path.join(candidate, "img"))
-        if has_json or has_img:
-            data_root = candidate
-            print(f"  📂 Data found at: {data_root}")
-            break
+    local_data_path = "/content/hateful-memes-data"
 
-    if data_root is None:
-        data_root = project_root
-        print(f"  ⚠️  Data not found separately, using project root: {data_root}")
+    # Check if data is already on local SSD (from a previous copy)
+    local_has_data = (
+        os.path.exists(os.path.join(local_data_path, "img")) and
+        (os.path.exists(os.path.join(local_data_path, "JSON Files", "train.jsonl")) or
+         os.path.exists(os.path.join(local_data_path, "train.jsonl")))
+    )
+
+    if local_has_data:
+        data_root = local_data_path
+        print(f"  📂 Data already on local SSD: {data_root} (fast I/O ⚡)")
+    else:
+        # Find data on Drive and copy to local SSD
+        drive_data_root = None
+        for candidate in drive_data_candidates:
+            has_json = os.path.exists(os.path.join(candidate, "JSON Files", "train.jsonl")) or \
+                       os.path.exists(os.path.join(candidate, "train.jsonl"))
+            has_img = os.path.exists(os.path.join(candidate, "img"))
+            if has_json or has_img:
+                drive_data_root = candidate
+                break
+
+        if drive_data_root is None:
+            # Fallback: use project root
+            data_root = project_root
+            print(f"  ⚠️  Data not found on Drive, using project root: {data_root}")
+        else:
+            # Copy Drive data → local SSD for fast I/O
+            print(f"  📂 Data found on Drive: {drive_data_root}")
+            print(f"  ⏳ Copying data to local SSD for fast I/O (one-time, ~2-5 min)...")
+            import shutil
+            os.makedirs(local_data_path, exist_ok=True)
+
+            for folder in ["img", "JSON Files", "CSV Files"]:
+                src = os.path.join(drive_data_root, folder)
+                dst = os.path.join(local_data_path, folder)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    print(f"     Copying {folder}/ ...")
+                    shutil.copytree(src, dst)
+
+            data_root = local_data_path
+            print(f"  ✅ Data copied to local SSD: {data_root} (fast I/O ⚡)")
 
     # ── 5. Set output dirs (persistent in Drive) ───────────────────────
     output_base = "/content/drive/MyDrive/hateful_memes_results"
