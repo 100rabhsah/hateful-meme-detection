@@ -39,6 +39,9 @@ import time
 #  🎛️  EXPERIMENT SELECTOR — CHANGE THIS TO RUN DIFFERENT EXPERIMENTS
 # ════════════════════════════════════════════════════════════════════════════
 #
+#  v2: Fixed architecture — frozen backbones, Barlow-Twins decorrelation,
+#      no residual in incongruity branch, label smoothing, 10 epochs
+#
 #   ID  │ Mode        │ Data       │ Validation    │ Description
 #  ─────┼─────────────┼────────────┼───────────────┼──────────────────────────────
 #   1   │ sequence    │ balanced   │ normal split  │ Baseline: full token cross-attn
@@ -51,7 +54,7 @@ import time
 #   8   │ cls         │ augmented  │ normal split  │ CLS-only baseline + augmented
 #
 
-EXPERIMENT_ID = 4   # ← CHANGE THIS (1–8)
+EXPERIMENT_ID = 3   # ← CHANGE THIS (1–8)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -289,14 +292,14 @@ from src.utils.visualization import (
 # ════════════════════════════════════════════════════════════════════════════
 
 EXPERIMENTS = {
-    1: {"name": "seq_bal_e5",       "mode": "sequence",   "augmented": False, "dual_path": False, "kfold": 0},
-    2: {"name": "seq_aug_e5",       "mode": "sequence",   "augmented": True,  "dual_path": False, "kfold": 0},
-    3: {"name": "dual_bal_e5",      "mode": "dual-path",  "augmented": False, "dual_path": True,  "kfold": 0},
-    4: {"name": "dual_aug_e5",      "mode": "dual-path",  "augmented": True,  "dual_path": True,  "kfold": 0},
-    5: {"name": "dual_bal_kf5",     "mode": "dual-path",  "augmented": False, "dual_path": True,  "kfold": 5},
-    6: {"name": "dual_aug_kf5",     "mode": "dual-path",  "augmented": True,  "dual_path": True,  "kfold": 5},
-    7: {"name": "cls_bal_e5",       "mode": "cls",        "augmented": False, "dual_path": False, "kfold": 0},
-    8: {"name": "cls_aug_e5",       "mode": "cls",        "augmented": True,  "dual_path": False, "kfold": 0},
+    1: {"name": "v2_seq_bal",       "mode": "sequence",   "augmented": False, "dual_path": False, "kfold": 0},
+    2: {"name": "v2_seq_aug",       "mode": "sequence",   "augmented": True,  "dual_path": False, "kfold": 0},
+    3: {"name": "v2_dual_bal",      "mode": "dual-path",  "augmented": False, "dual_path": True,  "kfold": 0},
+    4: {"name": "v2_dual_aug",      "mode": "dual-path",  "augmented": True,  "dual_path": True,  "kfold": 0},
+    5: {"name": "v2_dual_bal_kf5",  "mode": "dual-path",  "augmented": False, "dual_path": True,  "kfold": 5},
+    6: {"name": "v2_dual_aug_kf5",  "mode": "dual-path",  "augmented": True,  "dual_path": True,  "kfold": 5},
+    7: {"name": "v2_cls_bal",       "mode": "cls",        "augmented": False, "dual_path": False, "kfold": 0},
+    8: {"name": "v2_cls_aug",       "mode": "cls",        "augmented": True,  "dual_path": False, "kfold": 0},
 }
 
 exp = EXPERIMENTS[EXPERIMENT_ID]
@@ -351,23 +354,47 @@ config = ExperimentConfig(
         use_sequence_tokens=use_sequence,
         use_dual_path=exp["dual_path"],
         incongruity_lambda=0.5,
-        incongruity_loss_weight=0.1,
+        incongruity_loss_weight=0.5,   # v2: increased from 0.1 for stronger decorrelation
     ),
     training=TrainingConfig(
         learning_rate=2e-5,
         weight_decay=0.01,
-        num_epochs=5,
-        train_batch_size=64,      # A100: safe at 64 (use 32 for T4)
-        val_batch_size=64,        # A100: larger = faster eval
-        test_batch_size=64,       # A100: larger = faster eval
+        num_epochs=10,                 # v2: increased from 5 (frozen backbones need more epochs)
+        train_batch_size=64,           # A100: safe at 64 (use 32 for T4)
+        val_batch_size=64,             # A100: larger = faster eval
+        test_batch_size=64,            # A100: larger = faster eval
         random_seed=42,
-        num_workers=2,            # Colab Pro handles 2 workers fine
+        num_workers=2,                 # Colab Pro handles 2 workers fine
         use_class_weights=False,
         use_augmented_data=exp["augmented"],
         num_kfolds=exp["kfold"],
     ),
     experiment_name=exp["name"],
 )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  HELPER: Freeze pretrained backbones
+# ════════════════════════════════════════════════════════════════════════════
+
+def freeze_backbones(model):
+    """
+    Freeze BERT and ViT pretrained weights.
+    Only cross-attention heads, projection layers, and classifier are trained.
+    This prevents catastrophic forgetting with small datasets (~9K samples)
+    and drastically reduces overfitting.
+    """
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        if name.startswith("bert.") or name.startswith("vit."):
+            param.requires_grad = False
+            frozen_count += 1
+    total = sum(1 for _ in model.parameters())
+    trainable = sum(1 for p in model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n🧊 Frozen {frozen_count}/{total} parameter groups (backbones)")
+    print(f"   Trainable: {trainable} groups ({trainable_params:,} params)")
+    return model
 
 print(config.summary())
 
@@ -405,9 +432,10 @@ if exp["kfold"] > 0:
     for fold_idx, train_loader, val_loader, max_length in build_kfold_dataloaders(config):
         # Fresh model for each fold
         model = HatefulMemesClassifier(config.model)
-        criterion = nn.CrossEntropyLoss()
+        model = freeze_backbones(model)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # v2: label smoothing
         optimizer = optim.AdamW(
-            model.parameters(),
+            filter(lambda p: p.requires_grad, model.parameters()),  # v2: only trainable params
             lr=config.training.learning_rate,
             weight_decay=config.training.weight_decay,
         )
@@ -462,13 +490,14 @@ else:
     train_loader, val_loader, test_loader, max_length = build_dataloaders(config)
 
     model = HatefulMemesClassifier(config.model)
+    model = freeze_backbones(model)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\n🏗  Model: {total_params:,} params ({trainable_params:,} trainable)")
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # v2: label smoothing
     optimizer = optim.AdamW(
-        model.parameters(),
+        filter(lambda p: p.requires_grad, model.parameters()),  # v2: only trainable params
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
