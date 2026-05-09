@@ -26,43 +26,43 @@ import sys
 def setup_environment():
     """Auto-detect and configure environment (Colab vs Kaggle vs Local)."""
 
-    if os.path.exists("/content"):
-        # ── Google Colab ────────────────────────────────────────────────
-        print("🔵 Detected Google Colab environment")
-        try:
-            from google.colab import drive
-            drive.mount("/content/drive")
-            print("  ✅ Google Drive mounted")
-        except Exception:
-            print("  ⚠️  Drive mount failed — using local files")
+    # if os.path.exists("/content"):
+    #     # ── Google Colab ────────────────────────────────────────────────
+    #     print("🔵 Detected Google Colab environment")
+    #     try:
+    #         from google.colab import drive
+    #         drive.mount("/content/drive")
+    #         print("  ✅ Google Drive mounted")
+    #     except Exception:
+    #         print("  ⚠️  Drive mount failed — using local files")
 
-        # Install dependencies
-        os.system("pip install -q transformers torch torchvision scikit-learn tqdm matplotlib")
+    #     # Install dependencies
+    #     os.system("pip install -q transformers torch torchvision scikit-learn tqdm matplotlib")
 
-        # Set project root (clone or symlink the project here)
-        project_root = "/content/hateful_meme_detection"
-        if not os.path.exists(project_root):
-            # If the src/ folder is in Drive
-            drive_project = "/content/drive/MyDrive/hateful_meme_detection"
-            if os.path.exists(drive_project):
-                os.symlink(drive_project, project_root)
-                print(f"  Symlinked {drive_project} → {project_root}")
-            else:
-                print(f"  ⚠️  Project not found at {drive_project}")
-                print("  Please clone the repo or upload the project")
-                return None
-        return project_root
+    #     # Set project root (clone or symlink the project here)
+    #     project_root = "/kaggle/working/hateful-meme-detection"
+    #     if not os.path.exists(project_root):
+    #         # If the src/ folder is in Drive
+    #         drive_project = "/content/drive/MyDrive/hateful_meme_detection"
+    #         if os.path.exists(drive_project):
+    #             os.symlink(drive_project, project_root)
+    #             print(f"  Symlinked {drive_project} → {project_root}")
+    #         else:
+    #             print(f"  ⚠️  Project not found at {drive_project}")
+    #             print("  Please clone the repo or upload the project")
+    #             return None
+    #     return project_root
 
-    elif os.path.exists("/kaggle"):
+    if os.path.exists("/kaggle"):
         # ── Kaggle ──────────────────────────────────────────────────────
         print("🟠 Detected Kaggle environment")
         os.system("pip install -q transformers")
 
-        project_root = "/kaggle/input/hateful-meme-detection"
+        project_root = "/kaggle/working/hateful-meme-detection"
         if not os.path.exists(project_root):
             # Try to find it in available datasets
-            for d in os.listdir("/kaggle/input"):
-                candidate = f"/kaggle/input/{d}"
+            for d in os.listdir("/kaggle/input/datasets/sourabhsah04/hateful-memes-data"):
+                candidate = f"/kaggle/input/datasets/sourabhsah04/hateful-memes-data{d}"
                 if os.path.exists(os.path.join(candidate, "src")):
                     project_root = candidate
                     break
@@ -108,8 +108,18 @@ from src.utils.visualization import (
 #  All hyperparameters from your spec are set as defaults.
 #
 
+# 1. Create the default object
+custom_paths = PathConfig(environment="kaggle")
+# 2. Manually override the attributes (this happens AFTER __post_init__)
+custom_paths.data_root = "/kaggle/input/datasets/sourabhsah04/hateful-memes-data/hateful-memes-data"
+custom_paths.image_dir = "/kaggle/input/datasets/sourabhsah04/hateful-memes-data/hateful-memes-data/img"
+custom_paths.json_dir = "/kaggle/input/datasets/sourabhsah04/hateful-memes-data/hateful-memes-data/JSON Files"
+custom_paths.csv_dir = "/kaggle/input/datasets/sourabhsah04/hateful-memes-data/hateful-memes-data/CSV Files"
+custom_paths.output_dir = "/kaggle/working/"
+custom_paths.checkpoint_dir = "/kaggle/working/hateful-meme-detection"
+
 config = ExperimentConfig(
-    paths=PathConfig(),  # Auto-detects environment
+    paths=custom_paths,   # Auto-detects environment
     model=ModelConfig(
         bert_model_name="bert-base-uncased",
         vit_model_name="google/vit-base-patch16-224",

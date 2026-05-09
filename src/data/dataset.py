@@ -7,7 +7,8 @@ Decoupled from global state — all paths passed explicitly.
 import os
 import torch
 from torch.utils.data import Dataset
-from PIL import Image
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from torchvision import transforms
 from transformers import BertTokenizer
 from typing import Dict, List, Optional
