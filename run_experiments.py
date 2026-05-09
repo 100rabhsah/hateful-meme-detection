@@ -342,7 +342,11 @@ torch.manual_seed(config.training.random_seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(config.training.random_seed)
     print(f"🖥️  GPU: {torch.cuda.get_device_name(0)}")
-    print(f"   Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    try:
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"   Memory: {gpu_mem:.1f} GB")
+    except AttributeError:
+        pass  # older/newer torch versions may differ
 print(f"📱 Device: {config.device}\n")
 
 
