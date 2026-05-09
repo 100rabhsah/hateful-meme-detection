@@ -81,6 +81,11 @@ class ModelConfig:
     fusion_hidden_dim: int = 64       # Hidden dim in fusion MLP
     use_sequence_tokens: bool = True  # True = use full token sequences; False = CLS-only
 
+    # ── Dual-path cross-attention (NOVEL) ──────────────────────────────
+    use_dual_path: bool = False       # True = dual-path (alignment + incongruity)
+    incongruity_lambda: float = 0.5   # Initial λ for incongruity branch weighting
+    incongruity_loss_weight: float = 0.1  # Weight of auxiliary incongruity loss
+
 
 @dataclass
 class TrainingConfig:
@@ -100,6 +105,9 @@ class TrainingConfig:
     gradient_clip_max_norm: float = 1.0
     use_class_weights: bool = False    # Inverse-frequency class weighting
     use_augmented_data: bool = False   # Load augmented CSV instead of raw JSONL
+
+    # ── K-Fold cross-validation ────────────────────────────────────────
+    num_kfolds: int = 5               # Number of folds (0 = disabled, use normal split)
 
 
 @dataclass
@@ -135,16 +143,37 @@ class ExperimentConfig:
 
     def summary(self) -> str:
         """Print a human-readable summary of the experiment configuration."""
+        # Determine attention mode string
+        if self.model.use_dual_path:
+            attn_mode = "Dual-Path (Alignment + Incongruity)"
+        elif self.model.use_sequence_tokens:
+            attn_mode = "Full Sequence Cross-Attention"
+        else:
+            attn_mode = "CLS-Only Baseline"
+
+        kfold_str = f"{self.training.num_kfolds}-Fold CV" if self.training.num_kfolds > 0 else "Normal Split"
+
         lines = [
             f"{'='*60}",
             f"  Experiment: {self.experiment_name}",
             f"  Environment: {self.paths.environment}",
             f"  Device: {self.device}",
+            f"  Attention Mode: {attn_mode}",
+            f"  Validation: {kfold_str}",
             f"{'='*60}",
             f"  BERT: {self.model.bert_model_name}",
             f"  ViT:  {self.model.vit_model_name}",
             f"  Embed Dim: {self.model.embed_dim}  |  Attn Heads: {self.model.num_attention_heads}",
             f"  Dropout: {self.model.dropout}  |  Sequence Tokens: {self.model.use_sequence_tokens}",
+        ]
+
+        if self.model.use_dual_path:
+            lines.extend([
+                f"  Incongruity λ: {self.model.incongruity_lambda}  |  "
+                f"Incon. Loss Weight: {self.model.incongruity_loss_weight}",
+            ])
+
+        lines.extend([
             f"{'─'*60}",
             f"  LR: {self.training.learning_rate}  |  Epochs: {self.training.num_epochs}",
             f"  Batch (Train/Val/Test): {self.training.train_batch_size}/{self.training.val_batch_size}/{self.training.test_batch_size}",
@@ -152,5 +181,5 @@ class ExperimentConfig:
             f"  Weight Decay: {self.training.weight_decay}  |  Class Weights: {self.training.use_class_weights}",
             f"  Augmented Data: {self.training.use_augmented_data}",
             f"{'='*60}",
-        ]
+        ])
         return "\n".join(lines)

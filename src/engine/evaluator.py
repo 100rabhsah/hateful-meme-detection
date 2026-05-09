@@ -1,5 +1,6 @@
 """
 Evaluation: test set evaluation + model loading from checkpoint.
+Supports both standard and dual-path model outputs.
 """
 
 import os
@@ -17,6 +18,7 @@ from src.models.classifier import HatefulMemesClassifier
 def load_model_from_checkpoint(
     config: ExperimentConfig,
     checkpoint_path: Optional[str] = None,
+    fold: Optional[int] = None,
 ) -> HatefulMemesClassifier:
     """
     Load a model from a checkpoint file.
@@ -24,11 +26,13 @@ def load_model_from_checkpoint(
     Args:
         config: Experiment configuration.
         checkpoint_path: Path to .pth file. If None, loads the best checkpoint.
+        fold: Fold number (for k-fold). Used to construct checkpoint path.
     """
     if checkpoint_path is None:
+        fold_suffix = f"_fold{fold}" if fold is not None else ""
         checkpoint_path = os.path.join(
             config.paths.checkpoint_dir,
-            f"{config.experiment_name}_best.pth",
+            f"{config.experiment_name}{fold_suffix}_best.pth",
         )
 
     print(f"  Loading checkpoint: {checkpoint_path}")
@@ -73,11 +77,14 @@ def evaluate(
         attention_mask = attention_mask.to(device)
         labels = labels.to(device)
 
-        logits = model(
+        output = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             pixel_values=images,
         )
+
+        # Handle dict output (new interface)
+        logits = output['logits'] if isinstance(output, dict) else output
         loss = criterion(logits, labels)
         tracker.update(loss.item(), logits, labels)
 

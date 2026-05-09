@@ -1,5 +1,6 @@
 """
 Training loop with validation, checkpointing, and metrics logging.
+Supports both standard and dual-path (incongruity-aware) training.
 """
 
 import os
@@ -22,6 +23,7 @@ class Trainer:
         - Per-epoch validation
         - Best-model checkpointing (by validation F1)
         - Training history tracking
+        - Auxiliary incongruity loss (when dual-path is enabled)
     """
 
     def __init__(
@@ -33,6 +35,7 @@ class Trainer:
         criterion: nn.Module,
         optimizer: optim.Optimizer,
         scheduler: Optional[object] = None,
+        fold: Optional[int] = None,
     ):
         self.model = model
         self.config = config
@@ -42,6 +45,11 @@ class Trainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = config.device
+        self.fold = fold  # None for normal split, int for k-fold
+
+        # Dual-path settings
+        self.use_dual_path = config.model.use_dual_path
+        self.incon_loss_weight = config.model.incongruity_loss_weight
 
         # History
         self.train_history: List[EpochMetrics] = []
@@ -59,7 +67,9 @@ class Trainer:
         self.model.to(self.device)
         num_epochs = self.config.training.num_epochs
 
-        print(f"\n🚀 Starting training for {num_epochs} epochs on {self.device}")
+        fold_str = f" [Fold {self.fold}]" if self.fold is not None else ""
+        dual_str = " (Dual-Path)" if self.use_dual_path else ""
+        print(f"\n🚀 Starting training{fold_str}{dual_str} for {num_epochs} epochs on {self.device}")
         print(f"   Train batches: {len(self.train_loader)}  |  Val batches: {len(self.val_loader)}")
         print("─" * 70)
 
@@ -100,9 +110,10 @@ class Trainer:
         self.model.train()
         tracker = MetricsTracker()
 
+        fold_str = f" F{self.fold}" if self.fold is not None else ""
         loop = tqdm(
             self.train_loader,
-            desc=f"  Epoch {epoch}/{num_epochs} [Train]",
+            desc=f"  Epoch {epoch}/{num_epochs}{fold_str} [Train]",
             leave=False,
         )
         for images, input_ids, attention_mask, labels in loop:
@@ -113,12 +124,21 @@ class Trainer:
 
             # Forward
             self.optimizer.zero_grad()
-            logits = self.model(
+            output = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pixel_values=images,
             )
+
+            # Handle dict output (new interface)
+            logits = output['logits']
             loss = self.criterion(logits, labels)
+
+            # Add auxiliary incongruity loss if dual-path is enabled
+            if self.use_dual_path and 'incongruity_loss' in output:
+                incon_loss = output['incongruity_loss']
+                if incon_loss.requires_grad:
+                    loss = loss + self.incon_loss_weight * incon_loss
 
             # Backward
             loss.backward()
@@ -143,9 +163,10 @@ class Trainer:
         self.model.eval()
         tracker = MetricsTracker()
 
+        fold_str = f" F{self.fold}" if self.fold is not None else ""
         loop = tqdm(
             self.val_loader,
-            desc=f"  Epoch {epoch}/{num_epochs} [Val]  ",
+            desc=f"  Epoch {epoch}/{num_epochs}{fold_str} [Val]  ",
             leave=False,
         )
         for images, input_ids, attention_mask, labels in loop:
@@ -154,11 +175,13 @@ class Trainer:
             attention_mask = attention_mask.to(self.device)
             labels = labels.to(self.device)
 
-            logits = self.model(
+            output = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pixel_values=images,
             )
+
+            logits = output['logits']
             loss = self.criterion(logits, labels)
             tracker.update(loss.item(), logits, labels)
 
@@ -175,12 +198,15 @@ class Trainer:
     ):
         """Save model checkpoint."""
         ckpt_dir = self.config.paths.checkpoint_dir
+        exp_name = self.config.experiment_name
+        fold_suffix = f"_fold{self.fold}" if self.fold is not None else ""
+
         if tag:
-            filename = f"{self.config.experiment_name}_{tag}.pth"
+            filename = f"{exp_name}{fold_suffix}_{tag}.pth"
         elif is_best:
-            filename = f"{self.config.experiment_name}_best.pth"
+            filename = f"{exp_name}{fold_suffix}_best.pth"
         else:
-            filename = f"{self.config.experiment_name}_epoch{epoch}.pth"
+            filename = f"{exp_name}{fold_suffix}_epoch{epoch}.pth"
 
         path = os.path.join(ckpt_dir, filename)
         torch.save({
@@ -188,6 +214,7 @@ class Trainer:
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "best_val_f1": self.best_val_f1,
+            "fold": self.fold,
             "config": {
                 "experiment_name": self.config.experiment_name,
                 "model": vars(self.config.model),

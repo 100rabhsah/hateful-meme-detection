@@ -1,5 +1,6 @@
 """
 Data loading utilities: read JSONL/CSV, build dictionaries, create DataLoaders.
+Supports both normal train/val/test split and K-Fold cross-validation.
 """
 
 import json
@@ -7,9 +8,10 @@ import os
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from transformers import BertTokenizer
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Generator
+from sklearn.model_selection import StratifiedKFold
 
 from src.config import ExperimentConfig
 from src.data.dataset import (
@@ -119,7 +121,30 @@ def compute_class_weights(labels: Dict[str, int], device: str = "cpu") -> torch.
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
-# ── Master loader builder ──────────────────────────────────────────────────
+# ── Load raw data (shared helper) ──────────────────────────────────────────
+
+def _load_raw_data(config: ExperimentConfig) -> pd.DataFrame:
+    """Load and prepare raw data (shared between normal split and k-fold)."""
+    tc = config.training
+    pc = config.paths
+
+    if tc.use_augmented_data:
+        csv_path = os.path.join(pc.csv_dir, "shuffled_training_data.csv")
+        df = load_csv_data(csv_path)
+    else:
+        # Load all JSONL splits and concatenate
+        df = load_jsonl_data(
+            pc.json_dir,
+            files=["train.jsonl", "dev_seen.jsonl", "dev_unseen.jsonl",
+                   "test_seen.jsonl", "test_unseen.jsonl"],
+        )
+        # Balance by undersampling majority class
+        df = balance_dataset(df, random_state=tc.random_seed)
+
+    return df
+
+
+# ── Master loader builder (normal split) ───────────────────────────────────
 
 def build_dataloaders(
     config: ExperimentConfig,
@@ -135,18 +160,7 @@ def build_dataloaders(
     pc = config.paths
 
     # ── Step 1: Load raw data ───────────────────────────────────────────
-    if tc.use_augmented_data:
-        csv_path = os.path.join(pc.csv_dir, "shuffled_training_data.csv")
-        df = load_csv_data(csv_path)
-    else:
-        # Load all JSONL splits and concatenate (like original Balanced_Data notebook)
-        df = load_jsonl_data(
-            pc.json_dir,
-            files=["train.jsonl", "dev_seen.jsonl", "dev_unseen.jsonl",
-                   "test_seen.jsonl", "test_unseen.jsonl"],
-        )
-        # Balance by undersampling majority class
-        df = balance_dataset(df, random_state=tc.random_seed)
+    df = _load_raw_data(config)
 
     # ── Step 2: Build dicts ─────────────────────────────────────────────
     image_paths, texts, labels = df_to_dicts(df)
@@ -208,3 +222,83 @@ def build_dataloaders(
     )
 
     return train_loader, val_loader, test_loader, max_length
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  K-FOLD CROSS-VALIDATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def build_kfold_dataloaders(
+    config: ExperimentConfig,
+) -> Generator[Tuple[int, DataLoader, DataLoader, int], None, None]:
+    """
+    K-Fold cross-validation data loader generator.
+
+    Uses StratifiedKFold to maintain class balance in each fold.
+
+    Yields:
+        (fold_idx, train_loader, val_loader, max_token_length)
+        for each of the k folds.
+    """
+    tc = config.training
+    pc = config.paths
+    k = tc.num_kfolds
+
+    print(f"\n📦 Loading data for {k}-Fold Cross-Validation...")
+
+    # ── Step 1: Load raw data ───────────────────────────────────────────
+    df = _load_raw_data(config)
+
+    # ── Step 2: Build dicts ─────────────────────────────────────────────
+    image_paths, texts, labels = df_to_dicts(df)
+
+    # ── Step 3: Tokenizer + max length ──────────────────────────────────
+    print("\n🔤 Initializing tokenizer...")
+    tokenizer = BertTokenizer.from_pretrained(config.model.bert_model_name)
+    max_length = compute_max_token_length(list(texts.values()), tokenizer, cap=128)
+    print(f"  Max token length: {max_length}")
+
+    # ── Step 4: Build full dataset ──────────────────────────────────────
+    transform_eval = get_image_transform()
+    dataset = HatefulMemesDataset(
+        image_paths=image_paths,
+        texts=texts,
+        labels=labels,
+        image_root=pc.image_dir,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        transform=transform_eval,
+    )
+
+    # ── Step 5: Get labels array for stratification ─────────────────────
+    all_ids = dataset.ids
+    all_labels = np.array([labels[sid] for sid in all_ids])
+
+    # ── Step 6: StratifiedKFold ─────────────────────────────────────────
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=tc.random_seed)
+    num_workers = 0 if pc.environment in ("colab", "kaggle") else tc.num_workers
+
+    for fold_idx, (train_indices, val_indices) in enumerate(skf.split(all_ids, all_labels), 1):
+        print(f"\n{'═'*60}")
+        print(f"  📂 Fold {fold_idx}/{k}  —  Train: {len(train_indices)}  |  Val: {len(val_indices)}")
+        print(f"{'═'*60}")
+
+        train_subset = Subset(dataset, train_indices.tolist())
+        val_subset = Subset(dataset, val_indices.tolist())
+
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=tc.train_batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=tc.pin_memory,
+        )
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=tc.val_batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=tc.pin_memory,
+        )
+
+        yield fold_idx, train_loader, val_loader, max_length

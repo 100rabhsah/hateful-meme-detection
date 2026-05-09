@@ -2,12 +2,25 @@
 """
 Local training entry point for Hateful Meme Detection.
 
+Supports three modes of operation:
+    Phase 1 — Normal split training (standard or dual-path)
+    Phase 2 — K-Fold cross-validation
+
 Usage:
     # Default: sequence-level cross-attention on balanced data
     python train.py
 
     # CLS-only baseline
     python train.py --mode cls
+
+    # NOVEL: Dual-path cross-attention (alignment + incongruity)
+    python train.py --mode dual-path
+
+    # K-Fold cross-validation (5 folds)
+    python train.py --kfold 5
+
+    # Dual-path + K-Fold
+    python train.py --mode dual-path --kfold 5
 
     # Use augmented data
     python train.py --augmented
@@ -22,6 +35,7 @@ Usage:
 import argparse
 import sys
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,11 +44,12 @@ import torch.optim as optim
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.config import ExperimentConfig, PathConfig, ModelConfig, TrainingConfig
-from src.data.loader import build_dataloaders, compute_class_weights
+from src.data.loader import build_dataloaders, build_kfold_dataloaders, compute_class_weights
 from src.data.augmentation import run_augmentation
 from src.models.classifier import HatefulMemesClassifier
 from src.engine.trainer import Trainer
 from src.engine.evaluator import evaluate, load_model_from_checkpoint
+from src.engine.metrics import EpochMetrics
 from src.utils.visualization import (
     plot_training_curves,
     plot_metrics_comparison,
@@ -50,8 +65,10 @@ def parse_args():
 
     # Experiment mode
     parser.add_argument(
-        "--mode", choices=["sequence", "cls"], default="sequence",
-        help="'sequence' = full BERT tokens + ViT patches; 'cls' = CLS-only baseline",
+        "--mode", choices=["sequence", "cls", "dual-path"], default="sequence",
+        help="'sequence' = full BERT tokens + ViT patches; "
+             "'cls' = CLS-only baseline; "
+             "'dual-path' = NOVEL dual-path alignment + incongruity",
     )
     parser.add_argument(
         "--augmented", action="store_true",
@@ -64,6 +81,22 @@ def parse_args():
     parser.add_argument(
         "--class-weights", action="store_true",
         help="Use inverse-frequency class weights in loss",
+    )
+
+    # K-Fold cross-validation
+    parser.add_argument(
+        "--kfold", type=int, default=0,
+        help="Number of folds for cross-validation (0 = disabled, use normal split)",
+    )
+
+    # Dual-path specific
+    parser.add_argument(
+        "--incon-lambda", type=float, default=0.5,
+        help="Initial λ for incongruity branch weighting (dual-path mode)",
+    )
+    parser.add_argument(
+        "--incon-loss-weight", type=float, default=0.1,
+        help="Weight for auxiliary incongruity decorrelation loss",
     )
 
     # Hyperparameters
@@ -94,15 +127,21 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def build_config(args) -> ExperimentConfig:
+    """Build ExperimentConfig from CLI args."""
+    use_sequence = (args.mode in ("sequence", "dual-path"))
+    use_dual_path = (args.mode == "dual-path")
 
-    # ── Build config from CLI args ──────────────────────────────────────
-    use_sequence = (args.mode == "sequence")
+    # Auto-generate experiment name
+    if args.name:
+        experiment_name = args.name
+    else:
+        mode_str = "dual" if use_dual_path else ("seq" if use_sequence else "cls")
+        data_str = "aug" if args.augmented else "bal"
+        kfold_str = f"_kf{args.kfold}" if args.kfold > 0 else ""
+        experiment_name = f"{mode_str}_{data_str}_e{args.epochs}{kfold_str}"
 
-    experiment_name = args.name or f"{'seq' if use_sequence else 'cls'}_{('aug' if args.augmented else 'bal')}_e{args.epochs}"
-
-    config = ExperimentConfig(
+    return ExperimentConfig(
         paths=PathConfig(),
         model=ModelConfig(
             bert_model_name=args.bert,
@@ -111,6 +150,9 @@ def main():
             num_attention_heads=args.attn_heads,
             dropout=args.dropout,
             use_sequence_tokens=use_sequence,
+            use_dual_path=use_dual_path,
+            incongruity_lambda=args.incon_lambda,
+            incongruity_loss_weight=args.incon_loss_weight,
         ),
         training=TrainingConfig(
             learning_rate=args.lr,
@@ -122,28 +164,20 @@ def main():
             random_seed=args.seed,
             use_class_weights=args.class_weights,
             use_augmented_data=args.augmented,
+            num_kfolds=args.kfold,
         ),
         experiment_name=experiment_name,
     )
 
-    print(config.summary())
 
-    # ── Seed everything ─────────────────────────────────────────────────
-    torch.manual_seed(config.training.random_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.training.random_seed)
+def build_model_and_optimizer(config: ExperimentConfig):
+    """Build model, criterion, and optimizer."""
+    use_sequence = config.model.use_sequence_tokens
+    use_dual_path = config.model.use_dual_path
 
-    # ── Optional: run augmentation ──────────────────────────────────────
-    if args.run_augmentation:
-        run_augmentation(config)
-        if not args.augmented:
-            print("\n⚠️  Augmentation complete. Add --augmented to use augmented data for training.")
+    mode_str = "Dual-Path" if use_dual_path else ("Sequence Tokens" if use_sequence else "CLS Only")
+    print(f"\n🏗  Building model (mode: {mode_str})...")
 
-    # ── Build data loaders ──────────────────────────────────────────────
-    train_loader, val_loader, test_loader, max_length = build_dataloaders(config)
-
-    # ── Build model ─────────────────────────────────────────────────────
-    print(f"\n🏗  Building model (mode: {'Sequence Tokens' if use_sequence else 'CLS Only'})...")
     model = HatefulMemesClassifier(config.model)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -151,37 +185,41 @@ def main():
     print(f"   Total parameters:     {total_params:,}")
     print(f"   Trainable parameters: {trainable_params:,}")
 
-    # ── Loss function ───────────────────────────────────────────────────
+    # Loss function
     if config.training.use_class_weights:
-        from src.data.loader import compute_class_weights, df_to_dicts, load_jsonl_data, balance_dataset
-        # Recompute weights from the actual data split
-        # For simplicity, use uniform weighting; can be refined
         weights = torch.tensor([1.0, 1.5], device=config.device)
         criterion = nn.CrossEntropyLoss(weight=weights)
         print(f"   Using class weights: {weights.tolist()}")
     else:
         criterion = nn.CrossEntropyLoss()
 
-    # ── Optimizer ───────────────────────────────────────────────────────
+    # Optimizer
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
 
-    # ── Eval-only mode ──────────────────────────────────────────────────
-    if args.eval_only:
-        model = load_model_from_checkpoint(config, checkpoint_path=args.eval_only)
-        test_metrics = evaluate(model, test_loader, criterion, device=config.device)
-        if test_metrics.confusion_mat is not None:
-            plot_confusion_matrix(
-                test_metrics.confusion_mat,
-                config.paths.output_dir,
-                experiment_name=config.experiment_name,
-            )
-        return
+    return model, criterion, optimizer
 
-    # ── Train ───────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PHASE 1: Normal Split Training
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_normal_split(config: ExperimentConfig):
+    """Run training with normal train/val/test split."""
+    print("\n" + "═" * 70)
+    print("  PHASE 1: Normal Split Training")
+    print("═" * 70)
+
+    # Build data loaders
+    train_loader, val_loader, test_loader, max_length = build_dataloaders(config)
+
+    # Build model
+    model, criterion, optimizer = build_model_and_optimizer(config)
+
+    # Train
     trainer = Trainer(
         model=model,
         config=config,
@@ -192,12 +230,132 @@ def main():
     )
     history = trainer.train()
 
-    # ── Test ────────────────────────────────────────────────────────────
+    # Test
     print("\n📋 Evaluating on test set...")
     best_model = load_model_from_checkpoint(config)
     test_metrics = evaluate(best_model, test_loader, criterion, device=config.device)
 
-    # ── Visualize ───────────────────────────────────────────────────────
+    # Visualize
+    _generate_plots(history, test_metrics, config)
+
+    return history, test_metrics
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PHASE 2: K-Fold Cross-Validation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_kfold_cv(config: ExperimentConfig):
+    """
+    Run K-Fold cross-validation.
+
+    For each fold:
+        1. Build train/val loaders (stratified)
+        2. Train a fresh model
+        3. Evaluate on the fold's validation set
+
+    Reports mean ± std across all folds for each metric.
+    """
+    k = config.training.num_kfolds
+    print("\n" + "═" * 70)
+    print(f"  PHASE 2: {k}-Fold Stratified Cross-Validation")
+    print("═" * 70)
+
+    fold_metrics: list[EpochMetrics] = []
+
+    for fold_idx, train_loader, val_loader, max_length in build_kfold_dataloaders(config):
+        # Build a FRESH model for each fold
+        model, criterion, optimizer = build_model_and_optimizer(config)
+
+        # Train
+        trainer = Trainer(
+            model=model,
+            config=config,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            fold=fold_idx,
+        )
+        history = trainer.train()
+
+        # The best validation metrics for this fold
+        best_val = max(history["val"], key=lambda m: m.f1)
+        fold_metrics.append(best_val)
+
+        print(f"\n📊 Fold {fold_idx} Best Val: "
+              f"Acc={best_val.accuracy:.4f}  F1={best_val.f1:.4f}  "
+              f"AUC={best_val.auc_roc:.4f}" if best_val.auc_roc else "")
+
+    # ── Aggregate results across folds ──────────────────────────────────
+    _print_kfold_summary(fold_metrics, k, config)
+
+    return fold_metrics
+
+
+def _print_kfold_summary(fold_metrics: list, k: int, config: ExperimentConfig):
+    """Print and save k-fold cross-validation summary."""
+    accuracies = [m.accuracy for m in fold_metrics]
+    precisions = [m.precision for m in fold_metrics]
+    recalls = [m.recall for m in fold_metrics]
+    f1_scores = [m.f1 for m in fold_metrics]
+    auc_scores = [m.auc_roc for m in fold_metrics if m.auc_roc is not None]
+
+    print("\n" + "═" * 70)
+    print(f"  📊 {k}-Fold Cross-Validation Summary")
+    print("═" * 70)
+    print(f"  {'Metric':<15} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
+    print(f"  {'─'*55}")
+    print(f"  {'Accuracy':<15} {np.mean(accuracies):>10.4f} {np.std(accuracies):>10.4f} "
+          f"{np.min(accuracies):>10.4f} {np.max(accuracies):>10.4f}")
+    print(f"  {'Precision':<15} {np.mean(precisions):>10.4f} {np.std(precisions):>10.4f} "
+          f"{np.min(precisions):>10.4f} {np.max(precisions):>10.4f}")
+    print(f"  {'Recall':<15} {np.mean(recalls):>10.4f} {np.std(recalls):>10.4f} "
+          f"{np.min(recalls):>10.4f} {np.max(recalls):>10.4f}")
+    print(f"  {'F1 Score':<15} {np.mean(f1_scores):>10.4f} {np.std(f1_scores):>10.4f} "
+          f"{np.min(f1_scores):>10.4f} {np.max(f1_scores):>10.4f}")
+    if auc_scores:
+        print(f"  {'AUC-ROC':<15} {np.mean(auc_scores):>10.4f} {np.std(auc_scores):>10.4f} "
+              f"{np.min(auc_scores):>10.4f} {np.max(auc_scores):>10.4f}")
+    print("═" * 70)
+
+    # Per-fold breakdown
+    print(f"\n  Per-Fold Breakdown:")
+    print(f"  {'Fold':<6} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'F1':>10} {'AUC':>10}")
+    print(f"  {'─'*56}")
+    for i, m in enumerate(fold_metrics, 1):
+        auc_str = f"{m.auc_roc:>10.4f}" if m.auc_roc is not None else f"{'N/A':>10}"
+        print(f"  {i:<6} {m.accuracy:>10.4f} {m.precision:>10.4f} "
+              f"{m.recall:>10.4f} {m.f1:>10.4f} {auc_str}")
+    print()
+
+    # Save summary to file
+    summary_path = os.path.join(config.paths.output_dir, f"{config.experiment_name}_kfold_summary.txt")
+    with open(summary_path, "w") as f:
+        f.write(f"{k}-Fold Cross-Validation Summary\n")
+        f.write(f"Experiment: {config.experiment_name}\n")
+        f.write(f"{'='*60}\n")
+        f.write(f"Accuracy:  {np.mean(accuracies):.4f} ± {np.std(accuracies):.4f}\n")
+        f.write(f"Precision: {np.mean(precisions):.4f} ± {np.std(precisions):.4f}\n")
+        f.write(f"Recall:    {np.mean(recalls):.4f} ± {np.std(recalls):.4f}\n")
+        f.write(f"F1 Score:  {np.mean(f1_scores):.4f} ± {np.std(f1_scores):.4f}\n")
+        if auc_scores:
+            f.write(f"AUC-ROC:   {np.mean(auc_scores):.4f} ± {np.std(auc_scores):.4f}\n")
+        f.write(f"{'='*60}\n\n")
+        f.write("Per-Fold Results:\n")
+        for i, m in enumerate(fold_metrics, 1):
+            f.write(f"Fold {i}: Acc={m.accuracy:.4f} P={m.precision:.4f} "
+                    f"R={m.recall:.4f} F1={m.f1:.4f} "
+                    f"AUC={m.auc_roc:.4f if m.auc_roc else 'N/A'}\n")
+    print(f"  💾 K-fold summary saved: {summary_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Plot helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _generate_plots(history, test_metrics, config):
+    """Generate and save all visualization plots."""
     print("\n📊 Generating plots...")
     plot_training_curves(
         history["train"], history["val"],
@@ -220,6 +378,50 @@ def main():
             config.paths.output_dir,
             experiment_name=config.experiment_name,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    args = parse_args()
+    config = build_config(args)
+
+    print(config.summary())
+
+    # ── Seed everything ─────────────────────────────────────────────────
+    torch.manual_seed(config.training.random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.training.random_seed)
+
+    # ── Optional: run augmentation ──────────────────────────────────────
+    if args.run_augmentation:
+        run_augmentation(config)
+        if not args.augmented:
+            print("\n⚠️  Augmentation complete. Add --augmented to use augmented data for training.")
+
+    # ── Eval-only mode ──────────────────────────────────────────────────
+    if args.eval_only:
+        train_loader, val_loader, test_loader, _ = build_dataloaders(config)
+        _, criterion, _ = build_model_and_optimizer(config)
+        model = load_model_from_checkpoint(config, checkpoint_path=args.eval_only)
+        test_metrics = evaluate(model, test_loader, criterion, device=config.device)
+        if test_metrics.confusion_mat is not None:
+            plot_confusion_matrix(
+                test_metrics.confusion_mat,
+                config.paths.output_dir,
+                experiment_name=config.experiment_name,
+            )
+        return
+
+    # ── Run experiments ─────────────────────────────────────────────────
+    if config.training.num_kfolds > 0:
+        # Phase 2: K-Fold cross-validation
+        run_kfold_cv(config)
+    else:
+        # Phase 1: Normal split
+        run_normal_split(config)
 
     print(f"\n🎉 All done! Results saved to: {config.paths.output_dir}")
 
