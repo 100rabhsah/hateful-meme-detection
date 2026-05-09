@@ -129,7 +129,8 @@ class DualPathCrossAttention(nn.Module):
         self.align_dropout = nn.Dropout(dropout)
 
         # ── Incongruity branch ─────────────────────────────────────────
-        # Separate projection for keys/values to learn a different subspace
+        # Separate projections for query/key/value to learn a different subspace
+        self.incon_query_proj = nn.Linear(embed_dim, embed_dim)
         self.incon_key_proj = nn.Linear(embed_dim, embed_dim)
         self.incon_val_proj = nn.Linear(embed_dim, embed_dim)
         self.incon_attn = nn.MultiheadAttention(
@@ -185,13 +186,17 @@ class DualPathCrossAttention(nn.Module):
         align_out = self.align_norm(query + self.align_dropout(align_attn_out))
 
         # ── Incongruity branch: cross-attention in a different subspace ─
+        # NOTE: NO residual connection here — forces the branch to learn
+        # genuinely different (contrastive) representations instead of
+        # collapsing to ≈ query via the skip connection.
+        incon_query = self.incon_query_proj(query)
         incon_key = self.incon_key_proj(key)
         incon_val = self.incon_val_proj(value)
         incon_attn_out, _ = self.incon_attn(
-            query=query, key=incon_key, value=incon_val,
+            query=incon_query, key=incon_key, value=incon_val,
             key_padding_mask=key_padding_mask,
         )
-        incon_out = self.incon_norm(query + self.incon_dropout(incon_attn_out))
+        incon_out = self.incon_norm(self.incon_dropout(incon_attn_out))
 
         # ── Gated fusion ───────────────────────────────────────────────
         # Instead of simple addition, use a learned gate to combine
@@ -210,40 +215,43 @@ def compute_incongruity_loss(
     query: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Auxiliary loss to enforce the dual-path separation:
+    Barlow-Twins-style decorrelation loss to enforce dual-path separation.
 
-    1. **Alignment similarity**: maximize cosine similarity between
-       alignment output and the original query (they should agree).
-    2. **Incongruity decorrelation**: minimize cosine similarity between
-       incongruity output and the original query (they should disagree).
-
-    The total loss encourages the alignment branch to find agreement
-    and the incongruity branch to find conflict.
+    Computes the cross-covariance matrix between the alignment and
+    incongruity branch outputs, then penalizes off-diagonal elements
+    (redundancy) while encouraging on-diagonal elements to be zero
+    (decorrelation). This provides much stronger gradient signal than
+    cosine similarity, which was trivially satisfied by residual connections.
 
     Args:
         align_out: [S, B, D] — alignment branch output
         incon_out: [S, B, D] — incongruity branch output
-        query:     [S, B, D] — original query input
+        query:     [S, B, D] — original query input (unused, kept for API compat)
 
     Returns:
         Scalar loss value.
     """
     # Mean-pool over sequence dimension → [B, D]
-    align_pooled = align_out.mean(dim=0)
-    incon_pooled = incon_out.mean(dim=0)
-    query_pooled = query.mean(dim=0)
+    align_pooled = align_out.mean(dim=0)   # [B, D]
+    incon_pooled = incon_out.mean(dim=0)   # [B, D]
 
-    # Alignment branch should be similar to query
-    align_sim = F.cosine_similarity(align_pooled, query_pooled, dim=-1).mean()
+    # Normalize each feature dimension across the batch (zero mean, unit variance)
+    align_norm = (align_pooled - align_pooled.mean(dim=0, keepdim=True))
+    align_std = align_norm.std(dim=0, keepdim=True).clamp(min=1e-6)
+    align_norm = align_norm / align_std
 
-    # Incongruity branch should be different from query
-    incon_sim = F.cosine_similarity(incon_pooled, query_pooled, dim=-1).mean()
+    incon_norm = (incon_pooled - incon_pooled.mean(dim=0, keepdim=True))
+    incon_std = incon_norm.std(dim=0, keepdim=True).clamp(min=1e-6)
+    incon_norm = incon_norm / incon_std
 
-    # Additionally: the two branches should be decorrelated from each other
-    branch_sim = F.cosine_similarity(align_pooled, incon_pooled, dim=-1).mean()
+    B = align_norm.shape[0]
 
-    # Loss = -align_similarity + incongruity_similarity + branch_correlation
-    # We want: high align_sim, low incon_sim, low branch_sim
-    loss = -align_sim + incon_sim + branch_sim
+    # Cross-correlation matrix [D, D]
+    cross_corr = (align_norm.T @ incon_norm) / B
+
+    # Barlow Twins loss: penalize all correlations between branches
+    # On-diagonal: should be 0 (decorrelated) → penalize (diag)^2
+    # Off-diagonal: should be 0 (no redundancy) → penalize (off-diag)^2
+    loss = (cross_corr ** 2).mean()
 
     return loss
