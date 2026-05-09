@@ -161,43 +161,27 @@ def setup_colab():
             print(f"  ⚠️  Data not found on Drive, using project root: {data_root}")
         else:
             # Copy Drive data → local SSD for fast I/O
+            # Using OS-level cp -r (much faster than Python shutil over Drive FUSE)
             print(f"  📂 Data found on Drive: {drive_data_root}")
             print(f"  ⏳ Copying data to local SSD for fast I/O...")
-            import shutil
-            from tqdm import tqdm
-
             os.makedirs(local_data_path, exist_ok=True)
 
+            import subprocess
             for folder in ["img", "JSON Files", "CSV Files"]:
                 src = os.path.join(drive_data_root, folder)
                 dst = os.path.join(local_data_path, folder)
                 if os.path.exists(src) and not os.path.exists(dst):
-                    # Count files and total size for progress bar
-                    all_files = []
-                    for root, dirs, files in os.walk(src):
-                        for f in files:
-                            all_files.append(os.path.join(root, f))
-
-                    total_size = sum(os.path.getsize(f) for f in all_files)
-                    size_mb = total_size / (1024 * 1024)
-
-                    os.makedirs(dst, exist_ok=True)
-                    copied_bytes = 0
-                    pbar = tqdm(
-                        all_files,
-                        desc=f"     {folder}/ ({size_mb:.0f} MB)",
-                        unit="file",
-                        leave=True,
+                    print(f"     📁 Copying {folder}/ ...", end=" ", flush=True)
+                    result = subprocess.run(
+                        ["cp", "-r", src, dst],
+                        capture_output=True, text=True,
                     )
-                    for filepath in pbar:
-                        rel_path = os.path.relpath(filepath, src)
-                        dest_file = os.path.join(dst, rel_path)
-                        os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                        shutil.copy2(filepath, dest_file)
-                        copied_bytes += os.path.getsize(filepath)
-                        pbar.set_postfix(
-                            copied=f"{copied_bytes / (1024*1024):.0f}/{size_mb:.0f} MB"
-                        )
+                    if result.returncode == 0:
+                        # Count files copied
+                        n_files = sum(len(f) for _, _, f in os.walk(dst))
+                        print(f"✅ ({n_files} files)")
+                    else:
+                        print(f"❌ Error: {result.stderr.strip()}")
 
             data_root = local_data_path
             print(f"  ✅ Data copied to local SSD: {data_root} (fast I/O ⚡)")
