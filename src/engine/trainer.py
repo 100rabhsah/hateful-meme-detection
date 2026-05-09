@@ -11,6 +11,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Optional, List, Dict
+import warnings
 
 from src.config import ExperimentConfig
 from src.engine.metrics import MetricsTracker, EpochMetrics
@@ -50,6 +51,10 @@ class Trainer:
         # Dual-path settings
         self.use_dual_path = config.model.use_dual_path
         self.incon_loss_weight = config.model.incongruity_loss_weight
+
+        # Early stopping (v2)
+        self.early_stop_patience = 3
+        self._no_improve_count = 0
 
         # History
         self.train_history: List[EpochMetrics] = []
@@ -94,10 +99,18 @@ class Trainer:
                 self.best_epoch = epoch
                 self._save_checkpoint(epoch, is_best=True)
                 print(f"   ⭐ New best model! Val F1: {val_metrics.f1:.4f}")
+                self._no_improve_count = 0
+            else:
+                self._no_improve_count += 1
 
             elapsed = time.time() - epoch_start
             print(f"   ⏱  Epoch {epoch} completed in {elapsed:.1f}s")
             print("─" * 70)
+
+            # ── Early stopping ──────────────────────────────────────────
+            if self._no_improve_count >= self.early_stop_patience:
+                print(f"\n⏹  Early stopping: no improvement for {self.early_stop_patience} epochs")
+                break
 
         # Save final model
         self._save_checkpoint(num_epochs, is_best=False, tag="final")
