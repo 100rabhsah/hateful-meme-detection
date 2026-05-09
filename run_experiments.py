@@ -161,19 +161,20 @@ def setup_colab():
             print(f"  ⚠️  Data not found on Drive, using project root: {data_root}")
         else:
             # Copy Drive data → local SSD for fast I/O
-            # Using OS-level cp -r (much faster than Python shutil over Drive FUSE)
+            # Using OS-level rsync (fast, and resumes automatically if interrupted)
             print(f"  📂 Data found on Drive: {drive_data_root}")
             print(f"  ⏳ Copying data to local SSD for fast I/O...")
             os.makedirs(local_data_path, exist_ok=True)
 
             import subprocess
             for folder in ["img", "JSON Files", "CSV Files"]:
-                src = os.path.join(drive_data_root, folder)
+                src = os.path.join(drive_data_root, folder) + "/"
                 dst = os.path.join(local_data_path, folder)
-                if os.path.exists(src) and not os.path.exists(dst):
-                    print(f"     📁 Copying {folder}/ ...", end=" ", flush=True)
+                if os.path.exists(os.path.join(drive_data_root, folder)):
+                    os.makedirs(dst, exist_ok=True)
+                    print(f"     📁 Syncing {folder}/ ...", end=" ", flush=True)
                     result = subprocess.run(
-                        ["cp", "-r", src, dst],
+                        ["rsync", "-a", src, dst],
                         capture_output=True, text=True,
                     )
                     if result.returncode == 0:
