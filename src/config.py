@@ -180,6 +180,7 @@ class ExperimentConfig:
             f"  Split: {self.training.train_ratio}/{self.training.val_ratio}/{self.training.test_ratio}",
             f"  Weight Decay: {self.training.weight_decay}  |  Class Weights: {self.training.use_class_weights}",
             f"  Augmented Data: {self.training.use_augmented_data}",
+            f"  Label Smoothing: 0.1  |  Backbone Freeze: Yes  |  Early Stop: 3 epochs",
             f"{'='*60}",
         ])
         return "\n".join(lines)
