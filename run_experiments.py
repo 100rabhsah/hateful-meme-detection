@@ -374,25 +374,57 @@ config = ExperimentConfig(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  HELPER: Freeze pretrained backbones
+#  HELPER: Partially freeze pretrained backbones
 # ════════════════════════════════════════════════════════════════════════════
 
-def freeze_backbones(model):
+def freeze_backbones(model, unfreeze_top_n=2):
     """
-    Freeze BERT and ViT pretrained weights.
-    Only cross-attention heads, projection layers, and classifier are trained.
-    This prevents catastrophic forgetting with small datasets (~9K samples)
-    and drastically reduces overfitting.
+    Partially freeze BERT and ViT pretrained weights.
+
+    Freezes embeddings + lower transformer layers, but keeps the top N
+    layers unfrozen for task-specific fine-tuning. This is the middle
+    ground between:
+      - v1 (all 196M trainable → catastrophic overfitting)
+      - v2-full-freeze (676K trainable → underfitting, capped at 0.67 F1)
+
+    BERT-base has layers encoder.layer.{0..11} → unfreeze {10, 11}
+    ViT-base has layers encoder.layer.{0..11}  → unfreeze {10, 11}
+
+    Args:
+        model: The classifier model.
+        unfreeze_top_n: Number of top transformer layers to keep trainable.
     """
-    frozen_count = 0
+    # Step 1: Freeze everything in backbones
     for name, param in model.named_parameters():
         if name.startswith("bert.") or name.startswith("vit."):
             param.requires_grad = False
-            frozen_count += 1
+
+    # Step 2: Unfreeze top N layers of BERT
+    bert_total_layers = 12  # BERT-base
+    for layer_idx in range(bert_total_layers - unfreeze_top_n, bert_total_layers):
+        for name, param in model.named_parameters():
+            if f"bert.encoder.layer.{layer_idx}." in name:
+                param.requires_grad = True
+
+    # Step 3: Unfreeze top N layers of ViT
+    vit_total_layers = 12  # ViT-base
+    for layer_idx in range(vit_total_layers - unfreeze_top_n, vit_total_layers):
+        for name, param in model.named_parameters():
+            if f"vit.encoder.layer.{layer_idx}." in name:
+                param.requires_grad = True
+
+    # Also unfreeze the final layernorms (post-encoder)
+    for name, param in model.named_parameters():
+        if "bert.pooler." in name or "vit.layernorm." in name:
+            param.requires_grad = True
+
+    # Report
+    frozen = sum(1 for p in model.parameters() if not p.requires_grad)
     total = sum(1 for _ in model.parameters())
-    trainable = sum(1 for p in model.parameters() if p.requires_grad)
+    trainable = total - frozen
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n🧊 Frozen {frozen_count}/{total} parameter groups (backbones)")
+    print(f"\n🧊 Frozen {frozen}/{total} parameter groups")
+    print(f"   Unfrozen top {unfreeze_top_n} layers of BERT + ViT")
     print(f"   Trainable: {trainable} groups ({trainable_params:,} params)")
     return model
 
