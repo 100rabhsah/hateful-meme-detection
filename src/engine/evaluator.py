@@ -29,22 +29,11 @@ def load_model_from_checkpoint(
         fold: Fold number (for k-fold). Used to construct checkpoint path.
     """
     if checkpoint_path is None:
-        import glob
         fold_suffix = f"_fold{fold}" if fold is not None else ""
-        # Find latest timestamped best checkpoint
-        pattern = os.path.join(
+        checkpoint_path = os.path.join(
             config.paths.checkpoint_dir,
-            f"{config.experiment_name}{fold_suffix}_best_*.pth",
+            f"{config.experiment_name}{fold_suffix}_best.pth",
         )
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            checkpoint_path = matches[-1]  # latest by timestamp
-        else:
-            # Fallback: old non-timestamped name (v1 compat)
-            checkpoint_path = os.path.join(
-                config.paths.checkpoint_dir,
-                f"{config.experiment_name}{fold_suffix}_best.pth",
-            )
 
     print(f"  Loading checkpoint: {checkpoint_path}")
     model = HatefulMemesClassifier(config.model)

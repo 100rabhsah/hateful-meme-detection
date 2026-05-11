@@ -209,19 +209,17 @@ class Trainer:
         is_best: bool = False,
         tag: str = "",
     ):
-        """Save model checkpoint with timestamp to avoid overwriting."""
-        from datetime import datetime
+        """Save model checkpoint."""
         ckpt_dir = self.config.paths.checkpoint_dir
         exp_name = self.config.experiment_name
         fold_suffix = f"_fold{self.fold}" if self.fold is not None else ""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
         if tag:
-            filename = f"{exp_name}{fold_suffix}_{tag}_{timestamp}.pth"
+            filename = f"{exp_name}{fold_suffix}_{tag}.pth"
         elif is_best:
-            filename = f"{exp_name}{fold_suffix}_best_{timestamp}.pth"
+            filename = f"{exp_name}{fold_suffix}_best.pth"
         else:
-            filename = f"{exp_name}{fold_suffix}_epoch{epoch}_{timestamp}.pth"
+            filename = f"{exp_name}{fold_suffix}_epoch{epoch}.pth"
 
         path = os.path.join(ckpt_dir, filename)
         torch.save({
