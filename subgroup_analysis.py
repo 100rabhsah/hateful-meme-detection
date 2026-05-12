@@ -33,9 +33,62 @@ from src.models.classifier import HatefulMemesClassifier
 # Detect environment
 if os.path.exists("/content"):
     ENV = "colab"
-    DATA_DIR = "/content/hateful-memes-data"
     CKPT_DIR = "/content/drive/MyDrive/hateful_memes_results/checkpoints"
     OUTPUT_DIR = "/content/drive/MyDrive/hateful_memes_results/outputs"
+
+    # ── Mount Google Drive ──────────────────────────────────────────────
+    from google.colab import drive
+    drive.mount("/content/drive", force_remount=False)
+
+    # ── Sync data from GDrive to local SSD for fast I/O ────────────────
+    local_data_path = "/content/hateful-memes-data"
+    drive_data_candidates = [
+        "/content/drive/MyDrive/hateful-memes-data",
+        "/content/drive/MyDrive/hateful_memes",
+        "/content/drive/MyDrive/hateful_memes_data",
+    ]
+
+    local_has_data = (
+        os.path.exists(os.path.join(local_data_path, "img")) and
+        os.path.exists(os.path.join(local_data_path, "JSON Files", "train.jsonl"))
+    )
+
+    if local_has_data:
+        DATA_DIR = local_data_path
+        print(f"  📂 Data already on local SSD: {DATA_DIR} (fast I/O ⚡)")
+    else:
+        drive_data_root = None
+        for candidate in drive_data_candidates:
+            if os.path.exists(os.path.join(candidate, "JSON Files", "train.jsonl")) or \
+               os.path.exists(os.path.join(candidate, "img")):
+                drive_data_root = candidate
+                break
+
+        if drive_data_root:
+            import subprocess
+            print(f"  📂 Data found on Drive: {drive_data_root}")
+            print(f"  ⏳ Copying data to local SSD for fast I/O...")
+            os.makedirs(local_data_path, exist_ok=True)
+            for folder in ["img", "JSON Files", "CSV Files"]:
+                src = os.path.join(drive_data_root, folder) + "/"
+                dst = os.path.join(local_data_path, folder)
+                if os.path.exists(os.path.join(drive_data_root, folder)):
+                    os.makedirs(dst, exist_ok=True)
+                    print(f"     📁 Syncing {folder}/ ...", end=" ", flush=True)
+                    result = subprocess.run(
+                        ["rsync", "-a", src, dst],
+                        capture_output=True, text=True,
+                    )
+                    if result.returncode == 0:
+                        n_files = sum(len(f) for _, _, f in os.walk(dst))
+                        print(f"✅ ({n_files} files)")
+                    else:
+                        print(f"❌ Error: {result.stderr.strip()}")
+            DATA_DIR = local_data_path
+            print(f"  ✅ Data copied to local SSD: {DATA_DIR} (fast I/O ⚡)")
+        else:
+            DATA_DIR = local_data_path
+            print(f"  ⚠️  Data not found on Drive, assuming: {DATA_DIR}")
 else:
     ENV = "local"
     DATA_DIR = "./data"
