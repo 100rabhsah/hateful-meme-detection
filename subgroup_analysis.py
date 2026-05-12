@@ -98,7 +98,7 @@ else:
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 64
 JSON_DIR = os.path.join(DATA_DIR, "JSON Files")
-IMAGE_DIR = os.path.join(DATA_DIR, "img")
+IMAGE_DIR = DATA_DIR  # JSONL paths already include 'img/' prefix
 
 # Models to evaluate: (name, checkpoint_filename, use_dual_path, use_sequence)
 MODELS = [
