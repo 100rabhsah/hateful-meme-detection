@@ -1,22 +1,40 @@
 """
-Hateful Meme Classifier using BERT token embeddings + ViT patch tokens
-with bidirectional cross-modal attention.
+Hateful Meme Classifier using BERT word embeddings + ViT patch embeddings
+with bidirectional word-to-patch cross-modal attention.
 
 Supports three modes:
-    1. CLS-only baseline (use_sequence_tokens=False, use_dual_path=False)
-    2. Full sequence cross-attention (use_sequence_tokens=True, use_dual_path=False)
-    3. Dual-path cross-attention (use_sequence_tokens=True, use_dual_path=True)  [NOVEL]
+    1. CLS-only baseline (use_word_patch_tokens=False, use_dual_path=False)
+    2. Word-to-patch cross-attention (use_word_patch_tokens=True, use_dual_path=False)
+    3. Dual-path word-to-patch cross-attention (use_word_patch_tokens=True, use_dual_path=True)  [NOVEL]
 
-Architecture (dual-path mode):
-    BERT(text) → [CLS, tok1, tok2, ..., tokN]  → Project to embed_dim
-    ViT(image) → [CLS, patch1, patch2, ..., patchM] → Project to embed_dim
+Architecture (word-to-patch / dual-path mode):
+    BERT(text) → [CLS, word1, word2, ..., wordN, SEP, PAD...]
+                   ↓ strip CLS → [word1, word2, ..., wordN, SEP, PAD...]
+                   ↓ project  → [B, S_w, 128]
 
-    Dual-Path Cross-Attention (per direction):
-        Alignment branch  → captures text-image agreement
-        Incongruity branch → captures text-image conflict
-        Gated fusion combines both branches
+    ViT(image) → [CLS, patch1, patch2, ..., patch196]
+                   ↓ strip CLS → [patch1, patch2, ..., patch196]
+                   ↓ project  → [B, 196, 128]
+
+    Word-to-Patch Cross-Attention (bidirectional):
+        Each word (e.g., "they", "taking", "over") attends to all 196 image patches
+        → captures which patches (faces, symbols, gestures, objects, demographic cues)
+           are relevant to each word.
+
+        Each image patch attends to all words
+        → captures which words are relevant to each spatial region.
+
+    Dual-Path mode additionally decomposes each direction into:
+        Alignment branch  → captures word-patch agreement
+        Incongruity branch → captures word-patch conflict
 
     Pool attended sequences → Concatenate → MLP → Binary classification
+
+Dimensions:
+    Word embedding:   768-dim (BERT) → 128-dim (projected), per WordPiece token
+    Patch embedding:  768-dim (ViT)  → 128-dim (projected), per 16×16 pixel patch
+    Number of patches: 14×14 = 196 (for 224×224 image with 16×16 patch size)
+    Cross-attention:   [S_w × 196] attention matrix with 8 heads (per-head dim = 16)
 """
 
 import torch
@@ -35,16 +53,19 @@ class HatefulMemesClassifier(nn.Module):
     """
     Multimodal classifier for hateful meme detection.
 
+    Uses word-to-patch cross-attention where each word in the sentence
+    independently attends to all image patches, and vice versa.
+
     Supports three modes controlled by config:
-        use_sequence_tokens=True, use_dual_path=False → Full token-level cross-attention
-        use_sequence_tokens=False                     → CLS-only baseline
-        use_dual_path=True                            → Dual-path (alignment + incongruity)
+        use_word_patch_tokens=True, use_dual_path=False → Word-to-patch cross-attention
+        use_word_patch_tokens=False                     → CLS-only baseline
+        use_dual_path=True                              → Dual-path (alignment + incongruity)
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.use_sequence = config.use_sequence_tokens
+        self.use_word_patch = config.use_word_patch_tokens
         self.use_dual_path = config.use_dual_path
 
         # ── Pretrained backbones ────────────────────────────────────────
@@ -52,6 +73,7 @@ class HatefulMemesClassifier(nn.Module):
         self.vit = ViTModel.from_pretrained(config.vit_model_name)
 
         # ── Projection heads: backbone_dim (768) → embed_dim (128) ─────
+        # Applied per-word and per-patch independently
         self.text_projection = nn.Sequential(
             nn.Linear(config.bert_hidden_size, config.embed_dim),
             nn.GELU(),
@@ -68,7 +90,7 @@ class HatefulMemesClassifier(nn.Module):
 
         # ── Cross-modal attention (bidirectional) ───────────────────────
         if self.use_dual_path:
-            # NOVEL: Dual-path cross-attention
+            # NOVEL: Dual-path word-to-patch cross-attention
             self.text_to_image_attn = DualPathCrossAttention(
                 embed_dim=config.embed_dim,
                 num_heads=config.num_attention_heads,
@@ -82,7 +104,7 @@ class HatefulMemesClassifier(nn.Module):
                 lambda_init=config.incongruity_lambda,
             )
         else:
-            # Standard single-path cross-attention
+            # Standard single-path word-to-patch cross-attention
             self.text_to_image_attn = CrossModalAttention(
                 embed_dim=config.embed_dim,
                 num_heads=config.num_attention_heads,
@@ -120,69 +142,87 @@ class HatefulMemesClassifier(nn.Module):
         bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         vit_out = self.vit(pixel_values=pixel_values)
 
-        if self.use_sequence:
+        if self.use_word_patch:
             if self.use_dual_path:
                 return self._forward_dual_path(bert_out, vit_out, attention_mask)
             else:
-                return self._forward_sequence(bert_out, vit_out, attention_mask)
+                return self._forward_word_patch(bert_out, vit_out, attention_mask)
         else:
             return self._forward_cls(bert_out, vit_out)
 
     def _forward_dual_path(self, bert_out, vit_out, attention_mask):
         """
-        Dual-path cross-attention (NOVEL).
+        Dual-path word-to-patch cross-attention (NOVEL).
 
-        Each direction (text→image, image→text) has two branches:
-            - Alignment: captures where modalities agree
-            - Incongruity: captures where modalities conflict
+        Each direction (words→patches, patches→words) has two branches:
+            - Alignment: captures where words and patches agree
+            - Incongruity: captures where words and patches conflict
 
-        An auxiliary decorrelation loss is computed to enforce branch separation.
+        CLS tokens are stripped from both BERT and ViT outputs so that
+        cross-attention operates purely on words ↔ patches.
+
+        Dimensions:
+            Word embeddings:  [B, S_w, 768] → project → [B, S_w, 128]
+            Patch embeddings: [B, 196, 768] → project → [B, 196, 128]
+            S_w = seq_len - 1 (CLS stripped; SEP/PAD still present, handled by mask)
+
+        An auxiliary decorrelation loss enforces branch separation.
         """
-        # Project all tokens
-        text_tokens = self.text_projection(bert_out.last_hidden_state)    # [B, S_t, D]
-        image_tokens = self.image_projection(vit_out.last_hidden_state)   # [B, S_i, D]
+        # Strip CLS token (position 0) from both modalities
+        # BERT: [CLS, word1, ..., wordN, SEP, PAD...] → [word1, ..., wordN, SEP, PAD...]
+        word_hidden = bert_out.last_hidden_state[:, 1:, :]   # [B, S_w, 768]
+        word_mask = attention_mask[:, 1:]                      # [B, S_w]
+
+        # ViT: [CLS, patch1, ..., patch196] → [patch1, ..., patch196]
+        patch_hidden = vit_out.last_hidden_state[:, 1:, :]    # [B, 196, 768]
+
+        # Project per-word and per-patch: 768 → 128
+        word_embeddings = self.text_projection(word_hidden)    # [B, S_w, 128]
+        patch_embeddings = self.image_projection(patch_hidden) # [B, 196, 128]
 
         # Transpose to [S, B, D] for nn.MultiheadAttention
-        text_tokens_t = text_tokens.permute(1, 0, 2)    # [S_t, B, D]
-        image_tokens_t = image_tokens.permute(1, 0, 2)  # [S_i, B, D]
+        word_seq = word_embeddings.permute(1, 0, 2)    # [S_w, B, 128]
+        patch_seq = patch_embeddings.permute(1, 0, 2)  # [196, B, 128]
 
-        # Key padding mask for text
-        text_key_padding_mask = (attention_mask == 0)  # [B, S_t]
+        # Key padding mask for words (True = ignore pad tokens)
+        word_key_padding_mask = (word_mask == 0)  # [B, S_w]
 
-        # ── Dual-path cross-attention: text → image ────────────────────
-        text_attended, t2i_align, t2i_incon = self.text_to_image_attn(
-            query=text_tokens_t,
-            key=image_tokens_t,
-            value=image_tokens_t,
-            key_padding_mask=None,
+        # ── Dual-path cross-attention: words → patches ─────────────────
+        # Each word attends to all 196 image patches
+        words_attended, t2i_align, t2i_incon = self.text_to_image_attn(
+            query=word_seq,
+            key=patch_seq,
+            value=patch_seq,
+            key_padding_mask=None,  # No padding in ViT patches
         )
 
-        # ── Dual-path cross-attention: image → text ────────────────────
-        image_attended, i2t_align, i2t_incon = self.image_to_text_attn(
-            query=image_tokens_t,
-            key=text_tokens_t,
-            value=text_tokens_t,
-            key_padding_mask=text_key_padding_mask,
+        # ── Dual-path cross-attention: patches → words ─────────────────
+        # Each image patch attends to all words
+        patches_attended, i2t_align, i2t_incon = self.image_to_text_attn(
+            query=patch_seq,
+            key=word_seq,
+            value=word_seq,
+            key_padding_mask=word_key_padding_mask,
         )
 
         # ── Compute auxiliary incongruity loss ─────────────────────────
         incon_loss_t2i = compute_incongruity_loss(
-            t2i_align, t2i_incon, text_tokens_t,
+            t2i_align, t2i_incon, word_seq,
         )
         incon_loss_i2t = compute_incongruity_loss(
-            i2t_align, i2t_incon, image_tokens_t,
+            i2t_align, i2t_incon, patch_seq,
         )
         total_incon_loss = (incon_loss_t2i + incon_loss_i2t) / 2.0
 
         # ── Pool and classify ──────────────────────────────────────────
-        text_attended = text_attended.permute(1, 0, 2)   # [B, S_t, D]
-        text_mask = attention_mask.unsqueeze(-1).float()  # [B, S_t, 1]
-        text_pooled = (text_attended * text_mask).sum(dim=1) / text_mask.sum(dim=1).clamp(min=1)
+        words_attended = words_attended.permute(1, 0, 2)     # [B, S_w, 128]
+        word_mask_expanded = word_mask.unsqueeze(-1).float()  # [B, S_w, 1]
+        word_pooled = (words_attended * word_mask_expanded).sum(dim=1) / word_mask_expanded.sum(dim=1).clamp(min=1)
 
-        image_attended = image_attended.permute(1, 0, 2)  # [B, S_i, D]
-        image_pooled = image_attended.mean(dim=1)          # [B, D]
+        patches_attended = patches_attended.permute(1, 0, 2)  # [B, 196, 128]
+        patch_pooled = patches_attended.mean(dim=1)            # [B, 128]
 
-        combined = torch.cat([text_pooled, image_pooled], dim=1)  # [B, 2*D]
+        combined = torch.cat([word_pooled, patch_pooled], dim=1)  # [B, 256]
         logits = self.classifier(combined)
 
         return {
@@ -190,53 +230,71 @@ class HatefulMemesClassifier(nn.Module):
             'incongruity_loss': total_incon_loss,
         }
 
-    def _forward_sequence(self, bert_out, vit_out, attention_mask):
+    def _forward_word_patch(self, bert_out, vit_out, attention_mask):
         """
-        Full token-level cross-attention.
+        Word-to-patch cross-attention.
 
-        BERT: last_hidden_state → [B, seq_text, 768] → project → [B, seq_text, 128]
-        ViT:  last_hidden_state → [B, num_patches+1, 768] → project → [B, num_patches+1, 128]
-        Cross-attend both directions, then mean-pool each attended sequence.
+        Each word in the sentence independently attends to all image patches,
+        and each image patch attends to all words. This enables fine-grained
+        cross-modal interaction where individual words (e.g., "they", "taking",
+        "over") can separately attend to relevant image patches containing
+        faces, symbols, gestures, objects, or demographic cues.
+
+        CLS tokens are stripped from both BERT and ViT outputs.
+
+        Dimensions:
+            BERT words:  [B, S_w, 768] → project → [B, S_w, 128]
+            ViT patches: [B, 196, 768] → project → [B, 196, 128]
+              where S_w = seq_len - 1 (CLS removed), 196 = 14×14 patches
+              Each patch corresponds to a 16×16 pixel region of the 224×224 image
         """
-        # Project all tokens
-        text_tokens = self.text_projection(bert_out.last_hidden_state)    # [B, S_t, D]
-        image_tokens = self.image_projection(vit_out.last_hidden_state)   # [B, S_i, D]
+        # Strip CLS token (position 0) from both modalities
+        # BERT: [CLS, word1, ..., wordN, SEP, PAD...] → [word1, ..., wordN, SEP, PAD...]
+        word_hidden = bert_out.last_hidden_state[:, 1:, :]   # [B, S_w, 768]
+        word_mask = attention_mask[:, 1:]                      # [B, S_w]
+
+        # ViT: [CLS, patch1, ..., patch196] → [patch1, ..., patch196]
+        patch_hidden = vit_out.last_hidden_state[:, 1:, :]    # [B, 196, 768]
+
+        # Project per-word and per-patch: 768 → 128
+        word_embeddings = self.text_projection(word_hidden)    # [B, S_w, 128]
+        patch_embeddings = self.image_projection(patch_hidden) # [B, 196, 128]
 
         # Transpose to [S, B, D] for nn.MultiheadAttention
-        text_tokens_t = text_tokens.permute(1, 0, 2)    # [S_t, B, D]
-        image_tokens_t = image_tokens.permute(1, 0, 2)  # [S_i, B, D]
+        word_seq = word_embeddings.permute(1, 0, 2)    # [S_w, B, 128]
+        patch_seq = patch_embeddings.permute(1, 0, 2)  # [196, B, 128]
 
-        # Key padding mask for text (True = ignore pad tokens)
-        text_key_padding_mask = (attention_mask == 0)  # [B, S_t]
+        # Key padding mask for words (True = ignore pad tokens)
+        word_key_padding_mask = (word_mask == 0)  # [B, S_w]
 
-        # Cross-attention: text attending to image patches
-        text_attended = self.text_to_image_attn(
-            query=text_tokens_t,
-            key=image_tokens_t,
-            value=image_tokens_t,
+        # Cross-attention: each word attends to all image patches
+        words_attended = self.text_to_image_attn(
+            query=word_seq,
+            key=patch_seq,
+            value=patch_seq,
             key_padding_mask=None,  # No padding in ViT patches
-        )  # [S_t, B, D]
+        )  # [S_w, B, 128]
 
-        # Cross-attention: image patches attending to text tokens
-        image_attended = self.image_to_text_attn(
-            query=image_tokens_t,
-            key=text_tokens_t,
-            value=text_tokens_t,
-            key_padding_mask=text_key_padding_mask,
-        )  # [S_i, B, D]
+        # Cross-attention: each image patch attends to all words
+        patches_attended = self.image_to_text_attn(
+            query=patch_seq,
+            key=word_seq,
+            value=word_seq,
+            key_padding_mask=word_key_padding_mask,
+        )  # [196, B, 128]
 
-        # Mean-pool over sequence dimension (masking pad tokens for text)
-        # text_attended: [S_t, B, D] → [B, D]
-        text_attended = text_attended.permute(1, 0, 2)   # [B, S_t, D]
-        text_mask = attention_mask.unsqueeze(-1).float()  # [B, S_t, 1]
-        text_pooled = (text_attended * text_mask).sum(dim=1) / text_mask.sum(dim=1).clamp(min=1)
+        # Mean-pool over words (masked) and patches
+        # words_attended: [S_w, B, 128] → [B, 128]
+        words_attended = words_attended.permute(1, 0, 2)      # [B, S_w, 128]
+        word_mask_expanded = word_mask.unsqueeze(-1).float()   # [B, S_w, 1]
+        word_pooled = (words_attended * word_mask_expanded).sum(dim=1) / word_mask_expanded.sum(dim=1).clamp(min=1)
 
-        # image_attended: [S_i, B, D] → [B, D]
-        image_attended = image_attended.permute(1, 0, 2)  # [B, S_i, D]
-        image_pooled = image_attended.mean(dim=1)          # [B, D]
+        # patches_attended: [196, B, 128] → [B, 128]
+        patches_attended = patches_attended.permute(1, 0, 2)   # [B, 196, 128]
+        patch_pooled = patches_attended.mean(dim=1)             # [B, 128]
 
         # Fuse and classify
-        combined = torch.cat([text_pooled, image_pooled], dim=1)  # [B, 2*D]
+        combined = torch.cat([word_pooled, patch_pooled], dim=1)  # [B, 256]
         logits = self.classifier(combined)                         # [B, num_classes]
         return {'logits': logits, 'incongruity_loss': torch.tensor(0.0)}
 

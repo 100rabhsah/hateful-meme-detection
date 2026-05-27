@@ -7,13 +7,13 @@ Supports three modes of operation:
     Phase 2 — K-Fold cross-validation
 
 Usage:
-    # Default: sequence-level cross-attention on balanced data
+    # Default: word-to-patch cross-attention on balanced data
     python train.py
 
     # CLS-only baseline
     python train.py --mode cls
 
-    # NOVEL: Dual-path cross-attention (alignment + incongruity)
+    # NOVEL: Dual-path word-to-patch cross-attention (alignment + incongruity)
     python train.py --mode dual-path
 
     # K-Fold cross-validation (5 folds)
@@ -39,6 +39,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -65,10 +66,10 @@ def parse_args():
 
     # Experiment mode
     parser.add_argument(
-        "--mode", choices=["sequence", "cls", "dual-path"], default="sequence",
-        help="'sequence' = full BERT tokens + ViT patches; "
+        "--mode", choices=["word-patch", "cls", "dual-path"], default="word-patch",
+        help="'word-patch' = each word attends to all image patches (word-to-patch cross-attention); "
              "'cls' = CLS-only baseline; "
-             "'dual-path' = NOVEL dual-path alignment + incongruity",
+             "'dual-path' = NOVEL dual-path word-to-patch (alignment + incongruity)",
     )
     parser.add_argument(
         "--augmented", action="store_true",
@@ -115,6 +116,28 @@ def parse_args():
     parser.add_argument("--bert", default="bert-base-uncased", help="BERT model name")
     parser.add_argument("--vit", default="google/vit-base-patch16-224", help="ViT model name")
 
+    # Backbone freeze strategy
+    parser.add_argument(
+        "--freeze", choices=["none", "full", "partial"], default="partial",
+        help="'none' = all params trainable (~196M); "
+             "'full' = freeze all BERT+ViT (~676K trainable); "
+             "'partial' = unfreeze top-N layers (~29.6M trainable)",
+    )
+    parser.add_argument(
+        "--unfreeze-layers", type=int, default=2,
+        help="Number of top transformer layers to unfreeze (only for --freeze partial)",
+    )
+
+    # LR scheduler
+    parser.add_argument(
+        "--no-scheduler", action="store_true",
+        help="Disable cosine LR scheduler (use constant LR)",
+    )
+    parser.add_argument(
+        "--warmup-epochs", type=int, default=1,
+        help="Number of warmup epochs before cosine decay",
+    )
+
     # Experiment
     parser.add_argument("--name", default=None, help="Experiment name (auto-generated if None)")
 
@@ -129,17 +152,18 @@ def parse_args():
 
 def build_config(args) -> ExperimentConfig:
     """Build ExperimentConfig from CLI args."""
-    use_sequence = (args.mode in ("sequence", "dual-path"))
+    use_word_patch = (args.mode in ("word-patch", "dual-path"))
     use_dual_path = (args.mode == "dual-path")
 
     # Auto-generate experiment name
     if args.name:
         experiment_name = args.name
     else:
-        mode_str = "dual" if use_dual_path else ("seq" if use_sequence else "cls")
+        mode_str = "dual" if use_dual_path else ("wp" if use_word_patch else "cls")
         data_str = "aug" if args.augmented else "bal"
+        freeze_str = f"_{args.freeze}" if args.freeze != "partial" else ""
         kfold_str = f"_kf{args.kfold}" if args.kfold > 0 else ""
-        experiment_name = f"{mode_str}_{data_str}_e{args.epochs}{kfold_str}"
+        experiment_name = f"{mode_str}_{data_str}_e{args.epochs}{freeze_str}{kfold_str}"
 
     return ExperimentConfig(
         paths=PathConfig(),
@@ -149,7 +173,7 @@ def build_config(args) -> ExperimentConfig:
             embed_dim=args.embed_dim,
             num_attention_heads=args.attn_heads,
             dropout=args.dropout,
-            use_sequence_tokens=use_sequence,
+            use_word_patch_tokens=use_word_patch,
             use_dual_path=use_dual_path,
             incongruity_lambda=args.incon_lambda,
             incongruity_loss_weight=args.incon_loss_weight,
@@ -165,42 +189,137 @@ def build_config(args) -> ExperimentConfig:
             use_class_weights=args.class_weights,
             use_augmented_data=args.augmented,
             num_kfolds=args.kfold,
+            freeze_strategy=args.freeze,
+            unfreeze_top_n=args.unfreeze_layers,
+            use_lr_scheduler=not args.no_scheduler,
+            warmup_epochs=args.warmup_epochs,
         ),
         experiment_name=experiment_name,
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Backbone Freeze Strategy
+# ═══════════════════════════════════════════════════════════════════════════
+
+def freeze_backbones(model, strategy: str = "partial", unfreeze_top_n: int = 2):
+    """
+    Apply backbone freeze strategy.
+
+    Args:
+        model: HatefulMemesClassifier
+        strategy: "none" | "full" | "partial"
+            - none:    All parameters trainable (~196M). Best if enough data.
+            - full:    Freeze all BERT+ViT. Only heads trainable (~676K).
+            - partial: Freeze all except top-N transformer layers (~29.6M).
+        unfreeze_top_n: Layers to unfreeze (for "partial" mode).
+    """
+    if strategy == "none":
+        # Everything is trainable (default PyTorch behavior)
+        print(f"\n🔓 Freeze: NONE — all parameters trainable")
+
+    elif strategy == "full":
+        # Freeze all BERT and ViT parameters
+        for name, param in model.named_parameters():
+            if name.startswith("bert.") or name.startswith("vit."):
+                param.requires_grad = False
+        print(f"\n🧊 Freeze: FULL — all BERT+ViT frozen, only heads trainable")
+
+    elif strategy == "partial":
+        # Step 1: Freeze everything in backbones
+        for name, param in model.named_parameters():
+            if name.startswith("bert.") or name.startswith("vit."):
+                param.requires_grad = False
+
+        # Step 2: Unfreeze top N layers of BERT
+        bert_total_layers = 12  # BERT-base
+        for layer_idx in range(bert_total_layers - unfreeze_top_n, bert_total_layers):
+            for name, param in model.named_parameters():
+                if f"bert.encoder.layer.{layer_idx}." in name:
+                    param.requires_grad = True
+
+        # Step 3: Unfreeze top N layers of ViT
+        vit_total_layers = 12  # ViT-base
+        for layer_idx in range(vit_total_layers - unfreeze_top_n, vit_total_layers):
+            for name, param in model.named_parameters():
+                if f"vit.encoder.layer.{layer_idx}." in name:
+                    param.requires_grad = True
+
+        # Also unfreeze the final layernorms
+        for name, param in model.named_parameters():
+            if "bert.pooler." in name or "vit.layernorm." in name:
+                param.requires_grad = True
+
+        print(f"\n🧊 Freeze: PARTIAL — top {unfreeze_top_n} layers of BERT+ViT unfrozen")
+
+    # Report trainable parameter counts
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    print(f"   Total: {total_params:,}  |  Trainable: {trainable_params:,}  |  Frozen: {frozen_params:,}")
+
+    return model
+
+
 def build_model_and_optimizer(config: ExperimentConfig):
-    """Build model, criterion, and optimizer."""
-    use_sequence = config.model.use_sequence_tokens
+    """Build model, criterion, optimizer, and LR scheduler."""
+    use_word_patch = config.model.use_word_patch_tokens
     use_dual_path = config.model.use_dual_path
 
-    mode_str = "Dual-Path" if use_dual_path else ("Sequence Tokens" if use_sequence else "CLS Only")
+    mode_str = "Dual-Path Word-to-Patch" if use_dual_path else ("Word-to-Patch" if use_word_patch else "CLS Only")
     print(f"\n🏗  Building model (mode: {mode_str})...")
 
     model = HatefulMemesClassifier(config.model)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"   Total parameters:     {total_params:,}")
-    print(f"   Trainable parameters: {trainable_params:,}")
+    # Apply freeze strategy
+    model = freeze_backbones(
+        model,
+        strategy=config.training.freeze_strategy,
+        unfreeze_top_n=config.training.unfreeze_top_n,
+    )
 
-    # Loss function
+    # Loss function with label smoothing
     if config.training.use_class_weights:
         weights = torch.tensor([1.0, 1.5], device=config.device)
-        criterion = nn.CrossEntropyLoss(weight=weights)
+        criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
         print(f"   Using class weights: {weights.tolist()}")
     else:
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    # Optimizer
+    # Optimizer — only trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
 
-    return model, criterion, optimizer
+    # LR Scheduler — cosine annealing with linear warmup
+    scheduler = None
+    if config.training.use_lr_scheduler:
+        warmup_epochs = config.training.warmup_epochs
+        total_epochs = config.training.num_epochs
+
+        if warmup_epochs > 0 and total_epochs > warmup_epochs:
+            warmup_scheduler = LinearLR(
+                optimizer, start_factor=0.1, total_iters=warmup_epochs,
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer, T_max=total_epochs - warmup_epochs, eta_min=1e-7,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs],
+            )
+            print(f"   📈 LR Schedule: warmup ({warmup_epochs} ep) → cosine decay → {1e-7}")
+        else:
+            scheduler = CosineAnnealingLR(
+                optimizer, T_max=max(total_epochs, 1), eta_min=1e-7,
+            )
+            print(f"   📈 LR Schedule: cosine decay → {1e-7}")
+
+    return model, criterion, optimizer, scheduler
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -217,7 +336,7 @@ def run_normal_split(config: ExperimentConfig):
     train_loader, val_loader, test_loader, max_length = build_dataloaders(config)
 
     # Build model
-    model, criterion, optimizer = build_model_and_optimizer(config)
+    model, criterion, optimizer, scheduler = build_model_and_optimizer(config)
 
     # Train
     trainer = Trainer(
@@ -227,6 +346,7 @@ def run_normal_split(config: ExperimentConfig):
         val_loader=val_loader,
         criterion=criterion,
         optimizer=optimizer,
+        scheduler=scheduler,
     )
     history = trainer.train()
 
@@ -265,7 +385,7 @@ def run_kfold_cv(config: ExperimentConfig):
 
     for fold_idx, train_loader, val_loader, max_length in build_kfold_dataloaders(config):
         # Build a FRESH model for each fold
-        model, criterion, optimizer = build_model_and_optimizer(config)
+        model, criterion, optimizer, scheduler = build_model_and_optimizer(config)
 
         # Train
         trainer = Trainer(
@@ -275,6 +395,7 @@ def run_kfold_cv(config: ExperimentConfig):
             val_loader=val_loader,
             criterion=criterion,
             optimizer=optimizer,
+            scheduler=scheduler,
             fold=fold_idx,
         )
         history = trainer.train()
@@ -404,7 +525,7 @@ def main():
     # ── Eval-only mode ──────────────────────────────────────────────────
     if args.eval_only:
         train_loader, val_loader, test_loader, _ = build_dataloaders(config)
-        _, criterion, _ = build_model_and_optimizer(config)
+        _, criterion, _, _ = build_model_and_optimizer(config)
         model = load_model_from_checkpoint(config, checkpoint_path=args.eval_only)
         test_metrics = evaluate(model, test_loader, criterion, device=config.device)
         if test_metrics.confusion_mat is not None:

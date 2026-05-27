@@ -100,7 +100,7 @@ BATCH_SIZE = 64
 JSON_DIR = os.path.join(DATA_DIR, "JSON Files")
 IMAGE_DIR = DATA_DIR  # JSONL paths already include 'img/' prefix
 
-# Models to evaluate: (name, checkpoint_filename, use_dual_path, use_sequence)
+# Models to evaluate: (name, checkpoint_filename, use_dual_path, use_word_patch)
 MODELS = [
     ("CLS-only (Augmented)",     "v2_cls_aug_best.pth",   False, False),
     ("Sequence (Augmented)",     "v2_seq_aug_best.pth",   False, True),
@@ -150,7 +150,7 @@ def load_model(ckpt_path, use_dual_path, use_sequence):
         embed_dim=128,
         num_attention_heads=8,
         dropout=0.3,
-        use_sequence_tokens=use_sequence,
+        use_word_patch_tokens=use_sequence,
         use_dual_path=use_dual_path,
         incongruity_lambda=0.5,
         incongruity_loss_weight=0.5,

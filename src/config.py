@@ -69,17 +69,26 @@ class PathConfig:
 
 @dataclass
 class ModelConfig:
-    """Model architecture hyperparameters."""
+    """
+    Model architecture hyperparameters.
+
+    Dimension reference (word-to-patch cross-attention):
+        Word embedding:  BERT WordPiece token → 768-dim → projected to embed_dim (128)
+        Patch embedding:  ViT 16×16 pixel patch → 768-dim → projected to embed_dim (128)
+        Number of patches: 14×14 = 196  (for 224×224 image with 16×16 patch size)
+        Cross-attention:   Each word attends to all 196 patches (and vice versa)
+        Attention heads:   8 (per-head dim = 128 / 8 = 16)
+    """
     bert_model_name: str = "bert-base-uncased"
     vit_model_name: str = "google/vit-base-patch16-224"
-    bert_hidden_size: int = 768       # BERT base output dim
-    vit_hidden_size: int = 768        # ViT base output dim
+    bert_hidden_size: int = 768       # BERT base output dim (per word)
+    vit_hidden_size: int = 768        # ViT base output dim (per patch)
     embed_dim: int = 128              # Projection dimension for cross-attention
     num_attention_heads: int = 8      # Cross-modal attention heads
     num_classes: int = 2              # Binary: hateful / not-hateful
     dropout: float = 0.3
     fusion_hidden_dim: int = 64       # Hidden dim in fusion MLP
-    use_sequence_tokens: bool = True  # True = use full token sequences; False = CLS-only
+    use_word_patch_tokens: bool = True  # True = word-to-patch cross-attention; False = CLS-only
 
     # ── Dual-path cross-attention (NOVEL) ──────────────────────────────
     use_dual_path: bool = False       # True = dual-path (alignment + incongruity)
@@ -105,6 +114,14 @@ class TrainingConfig:
     gradient_clip_max_norm: float = 1.0
     use_class_weights: bool = False    # Inverse-frequency class weighting
     use_augmented_data: bool = False   # Load augmented CSV instead of raw JSONL
+
+    # ── Backbone freeze strategy ──────────────────────────────────────
+    freeze_strategy: str = "partial"   # "none" | "full" | "partial"
+    unfreeze_top_n: int = 2            # Layers to unfreeze (only for "partial")
+
+    # ── LR scheduler ──────────────────────────────────────────────────
+    use_lr_scheduler: bool = True      # Cosine annealing with warmup
+    warmup_epochs: int = 1             # Linear warmup before cosine decay
 
     # ── K-Fold cross-validation ────────────────────────────────────────
     num_kfolds: int = 5               # Number of folds (0 = disabled, use normal split)
@@ -145,9 +162,9 @@ class ExperimentConfig:
         """Print a human-readable summary of the experiment configuration."""
         # Determine attention mode string
         if self.model.use_dual_path:
-            attn_mode = "Dual-Path (Alignment + Incongruity)"
-        elif self.model.use_sequence_tokens:
-            attn_mode = "Full Sequence Cross-Attention"
+            attn_mode = "Dual-Path Word-to-Patch (Alignment + Incongruity)"
+        elif self.model.use_word_patch_tokens:
+            attn_mode = "Word-to-Patch Cross-Attention"
         else:
             attn_mode = "CLS-Only Baseline"
 
@@ -164,7 +181,7 @@ class ExperimentConfig:
             f"  BERT: {self.model.bert_model_name}",
             f"  ViT:  {self.model.vit_model_name}",
             f"  Embed Dim: {self.model.embed_dim}  |  Attn Heads: {self.model.num_attention_heads}",
-            f"  Dropout: {self.model.dropout}  |  Sequence Tokens: {self.model.use_sequence_tokens}",
+            f"  Dropout: {self.model.dropout}  |  Word-Patch Tokens: {self.model.use_word_patch_tokens}",
         ]
 
         if self.model.use_dual_path:
@@ -180,7 +197,9 @@ class ExperimentConfig:
             f"  Split: {self.training.train_ratio}/{self.training.val_ratio}/{self.training.test_ratio}",
             f"  Weight Decay: {self.training.weight_decay}  |  Class Weights: {self.training.use_class_weights}",
             f"  Augmented Data: {self.training.use_augmented_data}",
-            f"  Label Smoothing: 0.1  |  Backbone Freeze: Yes  |  Early Stop: 3 epochs",
+            f"  Freeze: {self.training.freeze_strategy} (top {self.training.unfreeze_top_n} unfrozen)  |  "
+            f"Scheduler: {'Cosine+Warmup' if self.training.use_lr_scheduler else 'None'}",
+            f"  Label Smoothing: 0.1  |  Early Stop: 3 epochs",
             f"{'='*60}",
         ])
         return "\n".join(lines)

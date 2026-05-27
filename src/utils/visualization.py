@@ -106,35 +106,76 @@ def plot_confusion_matrix(
     save_dir: str,
     experiment_name: str = "experiment",
     class_names: List[str] = None,
+    normalize: Optional[str] = None,
 ):
-    """Plot a confusion matrix heatmap."""
-    if class_names is None:
-        class_names = ["Not Hateful", "Hateful"]
+    """
+    Plot a confusion matrix heatmap.
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
-    ax.figure.colorbar(im, ax=ax)
+    Args:
+        cm: Raw confusion matrix (counts).
+        save_dir: Directory to save the plot.
+        experiment_name: Name for the title and filename.
+        class_names: Class labels.
+        normalize: Normalization mode:
+            - None: raw counts (default, backward-compatible)
+            - 'true': row-wise normalization (percentage per true class)
+            - 'pred': column-wise normalization (percentage per predicted class)
+    """
+    if class_names is None:
+        class_names = ["0 (Not Hateful)", "1 (Hateful)"]
+
+    # Compute normalized version if requested
+    if normalize == "true":
+        cm_display = cm.astype(float) / cm.sum(axis=1, keepdims=True) * 100
+        file_suffix = "_pct"
+        fmt_func = lambda val, raw: f"{val:.2f}"
+        colorbar_label = None
+    elif normalize == "pred":
+        cm_display = cm.astype(float) / cm.sum(axis=0, keepdims=True) * 100
+        file_suffix = "_pct_pred"
+        fmt_func = lambda val, raw: f"{val:.2f}"
+        colorbar_label = None
+    else:
+        cm_display = cm.astype(float)
+        file_suffix = ""
+        fmt_func = lambda val, raw: format(int(raw), "d")
+        colorbar_label = None
+
+    fig, ax = plt.subplots(figsize=(6.5, 5))
+    im = ax.imshow(cm_display, interpolation="nearest", cmap=plt.cm.Blues)
+    cbar = ax.figure.colorbar(im, ax=ax)
+    cbar.outline.set_visible(False)
+    if colorbar_label:
+        cbar.set_label(colorbar_label, fontsize=11)
 
     ax.set(
         xticks=np.arange(cm.shape[1]),
         yticks=np.arange(cm.shape[0]),
         xticklabels=class_names,
         yticklabels=class_names,
-        ylabel="True Label",
-        xlabel="Predicted Label",
-        title=f"Confusion Matrix — {experiment_name}",
+        ylabel="True",
+        xlabel="Predicted",
     )
+    
+    # Remove plot borders
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+        
+    ax.xaxis.set_tick_params(labelsize=11)
+    ax.yaxis.set_tick_params(labelsize=11)
 
     # Write values in cells
-    thresh = cm.max() / 2.0
+    thresh = cm_display.max() / 2.0
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            ax.text(j, i, format(cm[i, j], "d"),
-                    ha="center", va="center",
-                    color="white" if cm[i, j] > thresh else "black")
+            cell_text = fmt_func(cm_display[i, j], cm[i, j])
+            ax.text(j, i, cell_text,
+                    ha="center", va="center", fontsize=12,
+                    color="white" if cm_display[i, j] > thresh else "black")
 
     plt.tight_layout()
-    path = os.path.join(save_dir, f"{experiment_name}_confusion_matrix.png")
+    path = os.path.join(save_dir, f"{experiment_name}_confusion_matrix{file_suffix}.png")
     plt.savefig(path, dpi=150)
     plt.close()
     print(f"  🔢 Confusion matrix saved: {path}")
+    return path

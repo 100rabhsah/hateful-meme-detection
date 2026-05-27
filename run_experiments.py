@@ -4,7 +4,7 @@
 ║         Hateful Meme Detection — Unified Experiment Runner              ║
 ║                                                                          ║
 ║   Supports: Google Colab (Pro) • Kaggle • Local                         ║
-║   Modes  : sequence | cls | dual-path                                   ║
+║   Modes  : word-patch | cls | dual-path                                ║
 ║   Eval   : normal split | k-fold cross-validation                       ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -42,19 +42,19 @@ import time
 #  v2: Fixed architecture — frozen backbones, Barlow-Twins decorrelation,
 #      no residual in incongruity branch, label smoothing, 10 epochs
 #
-#   ID  │ Mode        │ Data       │ Validation    │ Description
-#  ─────┼─────────────┼────────────┼───────────────┼──────────────────────────────
-#   1   │ sequence    │ balanced   │ normal split  │ Baseline: full token cross-attn
-#   2   │ sequence    │ augmented  │ normal split  │ Baseline + augmented data
-#   3   │ dual-path   │ balanced   │ normal split  │ NOVEL dual-path on balanced
-#   4   │ dual-path   │ augmented  │ normal split  │ NOVEL dual-path on augmented
-#   5   │ dual-path   │ balanced   │ 5-fold CV     │ NOVEL dual-path + k-fold
-#   6   │ dual-path   │ augmented  │ 5-fold CV     │ NOVEL dual-path + k-fold + aug
-#   7   │ cls         │ balanced   │ normal split  │ CLS-only baseline
-#   8   │ cls         │ augmented  │ normal split  │ CLS-only baseline + augmented
+#   ID  │ Mode        │ Data       │ Freeze   │ Description
+#  ─────┼─────────────┼────────────┼──────────┼────────────────────────────────
+#   1   │ dual-path   │ augmented  │ partial  │ BEST: dual-path, partial freeze
+#   2   │ dual-path   │ augmented  │ full     │ dual-path, full freeze (heads only)
+#   3   │ dual-path   │ augmented  │ none     │ dual-path, all params trainable
+#   4   │ word-patch  │ augmented  │ partial  │ Word-patch baseline
+#   5   │ cls         │ augmented  │ partial  │ CLS-only baseline
+#   6   │ dual-path   │ balanced   │ partial  │ Dual-path on balanced data
+#   7   │ dual-path   │ augmented  │ partial  │ Dual-path + 5-fold CV
+#   8   │ word-patch  │ balanced   │ partial  │ Word-patch on balanced
 #
 
-EXPERIMENT_ID = 3   # ← CHANGE THIS (1–8)
+EXPERIMENT_ID = 1   # ← CHANGE THIS (1–8)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -292,18 +292,18 @@ from src.utils.visualization import (
 # ════════════════════════════════════════════════════════════════════════════
 
 EXPERIMENTS = {
-    1: {"name": "v2_seq_bal",       "mode": "sequence",   "augmented": False, "dual_path": False, "kfold": 0},
-    2: {"name": "v2_seq_aug",       "mode": "sequence",   "augmented": True,  "dual_path": False, "kfold": 0},
-    3: {"name": "v2_dual_bal",      "mode": "dual-path",  "augmented": False, "dual_path": True,  "kfold": 0},
-    4: {"name": "v2_dual_aug",      "mode": "dual-path",  "augmented": True,  "dual_path": True,  "kfold": 0},
-    5: {"name": "v2_dual_bal_kf5",  "mode": "dual-path",  "augmented": False, "dual_path": True,  "kfold": 5},
-    6: {"name": "v2_dual_aug_kf5",  "mode": "dual-path",  "augmented": True,  "dual_path": True,  "kfold": 5},
-    7: {"name": "v2_cls_bal",       "mode": "cls",        "augmented": False, "dual_path": False, "kfold": 0},
-    8: {"name": "v2_cls_aug",       "mode": "cls",        "augmented": True,  "dual_path": False, "kfold": 0},
+    1: {"name": "v3_dual_aug_partial",  "mode": "dual-path",  "augmented": True,  "dual_path": True,  "freeze": "partial",  "kfold": 0},
+    2: {"name": "v3_dual_aug_full",     "mode": "dual-path",  "augmented": True,  "dual_path": True,  "freeze": "full",     "kfold": 0},
+    3: {"name": "v3_dual_aug_none",     "mode": "dual-path",  "augmented": True,  "dual_path": True,  "freeze": "none",     "kfold": 0},
+    4: {"name": "v3_wp_aug_partial",    "mode": "word-patch", "augmented": True,  "dual_path": False, "freeze": "partial",  "kfold": 0},
+    5: {"name": "v3_cls_aug_partial",   "mode": "cls",        "augmented": True,  "dual_path": False, "freeze": "partial",  "kfold": 0},
+    6: {"name": "v3_dual_bal_partial",  "mode": "dual-path",  "augmented": False, "dual_path": True,  "freeze": "partial",  "kfold": 0},
+    7: {"name": "v3_dual_aug_kf5",     "mode": "dual-path",  "augmented": True,  "dual_path": True,  "freeze": "partial",  "kfold": 5},
+    8: {"name": "v3_wp_bal_partial",    "mode": "word-patch", "augmented": False, "dual_path": False, "freeze": "partial",  "kfold": 0},
 }
 
 exp = EXPERIMENTS[EXPERIMENT_ID]
-use_sequence = exp["mode"] in ("sequence", "dual-path")
+use_word_patch = exp["mode"] in ("word-patch", "dual-path")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -351,82 +351,71 @@ config = ExperimentConfig(
         embed_dim=128,
         num_attention_heads=8,
         dropout=0.3,
-        use_sequence_tokens=use_sequence,
+        use_word_patch_tokens=use_word_patch,
         use_dual_path=exp["dual_path"],
         incongruity_lambda=0.5,
-        incongruity_loss_weight=0.5,   # v2: increased from 0.1 for stronger decorrelation
+        incongruity_loss_weight=0.5,
     ),
     training=TrainingConfig(
         learning_rate=2e-5,
         weight_decay=0.01,
-        num_epochs=10,                 # v2: increased from 5 (frozen backbones need more epochs)
+        num_epochs=10,
         train_batch_size=64,           # A100: safe at 64 (use 32 for T4)
-        val_batch_size=64,             # A100: larger = faster eval
-        test_batch_size=64,            # A100: larger = faster eval
+        val_batch_size=64,
+        test_batch_size=64,
         random_seed=42,
-        num_workers=2,                 # Colab Pro handles 2 workers fine
+        num_workers=2,
         use_class_weights=False,
         use_augmented_data=exp["augmented"],
         num_kfolds=exp["kfold"],
+        freeze_strategy=exp["freeze"],
+        unfreeze_top_n=2,
+        use_lr_scheduler=True,
+        warmup_epochs=1,
     ),
     experiment_name=exp["name"],
 )
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  HELPER: Partially freeze pretrained backbones
+#  HELPER: Freeze + Scheduler (uses train.py's freeze_backbones)
 # ════════════════════════════════════════════════════════════════════════════
 
-def freeze_backbones(model, unfreeze_top_n=2):
-    """
-    Partially freeze BERT and ViT pretrained weights.
+from train import freeze_backbones
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-    Freezes embeddings + lower transformer layers, but keeps the top N
-    layers unfrozen for task-specific fine-tuning. This is the middle
-    ground between:
-      - v1 (all 196M trainable → catastrophic overfitting)
-      - v2-full-freeze (676K trainable → underfitting, capped at 0.67 F1)
 
-    BERT-base has layers encoder.layer.{0..11} → unfreeze {10, 11}
-    ViT-base has layers encoder.layer.{0..11}  → unfreeze {10, 11}
+def build_model_with_scheduler(config):
+    """Build model, criterion, optimizer, and LR scheduler."""
+    model = HatefulMemesClassifier(config.model)
+    model = freeze_backbones(
+        model,
+        strategy=config.training.freeze_strategy,
+        unfreeze_top_n=config.training.unfreeze_top_n,
+    )
 
-    Args:
-        model: The classifier model.
-        unfreeze_top_n: Number of top transformer layers to keep trainable.
-    """
-    # Step 1: Freeze everything in backbones
-    for name, param in model.named_parameters():
-        if name.startswith("bert.") or name.startswith("vit."):
-            param.requires_grad = False
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(
+        trainable_params,
+        lr=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
+    )
 
-    # Step 2: Unfreeze top N layers of BERT
-    bert_total_layers = 12  # BERT-base
-    for layer_idx in range(bert_total_layers - unfreeze_top_n, bert_total_layers):
-        for name, param in model.named_parameters():
-            if f"bert.encoder.layer.{layer_idx}." in name:
-                param.requires_grad = True
+    # Cosine LR scheduler with linear warmup
+    scheduler = None
+    if config.training.use_lr_scheduler:
+        warmup_epochs = config.training.warmup_epochs
+        total_epochs = config.training.num_epochs
+        if warmup_epochs > 0 and total_epochs > warmup_epochs:
+            warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+            cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs, eta_min=1e-7)
+            scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
+        else:
+            scheduler = CosineAnnealingLR(optimizer, T_max=max(total_epochs, 1), eta_min=1e-7)
+        print(f"   📈 LR Schedule: warmup ({config.training.warmup_epochs} ep) → cosine decay")
 
-    # Step 3: Unfreeze top N layers of ViT
-    vit_total_layers = 12  # ViT-base
-    for layer_idx in range(vit_total_layers - unfreeze_top_n, vit_total_layers):
-        for name, param in model.named_parameters():
-            if f"vit.encoder.layer.{layer_idx}." in name:
-                param.requires_grad = True
-
-    # Also unfreeze the final layernorms (post-encoder)
-    for name, param in model.named_parameters():
-        if "bert.pooler." in name or "vit.layernorm." in name:
-            param.requires_grad = True
-
-    # Report
-    frozen = sum(1 for p in model.parameters() if not p.requires_grad)
-    total = sum(1 for _ in model.parameters())
-    trainable = total - frozen
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n🧊 Frozen {frozen}/{total} parameter groups")
-    print(f"   Unfrozen top {unfreeze_top_n} layers of BERT + ViT")
-    print(f"   Trainable: {trainable} groups ({trainable_params:,} params)")
-    return model
+    return model, criterion, optimizer, scheduler
 
 print(config.summary())
 
@@ -462,15 +451,7 @@ if exp["kfold"] > 0:
 
     fold_metrics = []
     for fold_idx, train_loader, val_loader, max_length in build_kfold_dataloaders(config):
-        # Fresh model for each fold
-        model = HatefulMemesClassifier(config.model)
-        model = freeze_backbones(model)
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # v2: label smoothing
-        optimizer = optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),  # v2: only trainable params
-            lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
-        )
+        model, criterion, optimizer, scheduler = build_model_with_scheduler(config)
 
         trainer = Trainer(
             model=model,
@@ -479,6 +460,7 @@ if exp["kfold"] > 0:
             val_loader=val_loader,
             criterion=criterion,
             optimizer=optimizer,
+            scheduler=scheduler,
             fold=fold_idx,
         )
         history = trainer.train()
@@ -520,19 +502,7 @@ if exp["kfold"] > 0:
 else:
     # ── Normal Split Training ──────────────────────────────────────────
     train_loader, val_loader, test_loader, max_length = build_dataloaders(config)
-
-    model = HatefulMemesClassifier(config.model)
-    model = freeze_backbones(model)
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n🏗  Model: {total_params:,} params ({trainable_params:,} trainable)")
-
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # v2: label smoothing
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),  # v2: only trainable params
-        lr=config.training.learning_rate,
-        weight_decay=config.training.weight_decay,
-    )
+    model, criterion, optimizer, scheduler = build_model_with_scheduler(config)
 
     # Train
     trainer = Trainer(
@@ -542,6 +512,7 @@ else:
         val_loader=val_loader,
         criterion=criterion,
         optimizer=optimizer,
+        scheduler=scheduler,
     )
     history = trainer.train()
 
@@ -570,6 +541,13 @@ else:
             test_metrics.confusion_mat,
             output_dir,
             experiment_name=exp["name"],
+        )
+        # Also generate percentage-based confusion matrix
+        plot_confusion_matrix(
+            test_metrics.confusion_mat,
+            output_dir,
+            experiment_name=exp["name"],
+            normalize="true",
         )
 
 

@@ -1,16 +1,23 @@
 """
-Cross-modal attention modules.
+Cross-modal attention modules for word-to-patch interaction.
 
 Contains:
-    1. CrossModalAttention      — Standard single-path cross-attention (original)
+    1. CrossModalAttention      — Standard single-path word-to-patch cross-attention
     2. DualPathCrossAttention   — Novel dual-path: alignment + incongruity branches
 
+Word-to-Patch Cross-Attention:
+    Each word (WordPiece token from BERT, 128-dim after projection) attends to
+    all 196 image patches (16×16 pixel regions from ViT, 128-dim after projection).
+    This enables individual words like "they", "taking", "over" to separately
+    attend to relevant image patches containing faces, symbols, gestures, objects,
+    or demographic cues.
+
 The dual-path module explicitly models both *agreement* and *conflict*
-between modalities. This is motivated by the observation that hateful
+between words and patches. This is motivated by the observation that hateful
 memes frequently exploit the **incongruity** between benign text and
 harmful imagery (or vice versa). Standard cross-attention only captures
 alignment; the incongruity branch is trained to focus on mismatched
-regions via a decorrelation auxiliary loss.
+word-patch pairs via a decorrelation auxiliary loss.
 """
 
 import torch
@@ -20,11 +27,17 @@ import torch.nn.functional as F
 
 class CrossModalAttention(nn.Module):
     """
-    Multi-head cross-attention between two modalities.
+    Multi-head cross-attention between words and patches.
 
-    Given query tokens from one modality and key/value tokens from another,
-    this computes cross-attention — allowing each token in the query modality
-    to attend to all tokens in the key/value modality.
+    When used as word→patch attention:
+        query = word embeddings [S_w, B, 128] (each WordPiece token)
+        key/value = patch embeddings [196, B, 128] (each 16×16 image patch)
+        → Each word attends to all 196 patches
+
+    When used as patch→word attention:
+        query = patch embeddings [196, B, 128]
+        key/value = word embeddings [S_w, B, 128]
+        → Each patch attends to all words
 
     Input shapes (batch_first=False convention for nn.MultiheadAttention):
         query: [seq_len_q, batch_size, embed_dim]
@@ -54,13 +67,13 @@ class CrossModalAttention(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            query: [seq_q, B, D]
-            key:   [seq_kv, B, D]
-            value: [seq_kv, B, D]
-            key_padding_mask: [B, seq_kv] — True for positions to ignore.
+            query: [S_q, B, D] — word embeddings or patch embeddings
+            key:   [S_kv, B, D] — patch embeddings or word embeddings
+            value: [S_kv, B, D] — same as key
+            key_padding_mask: [B, S_kv] — True for positions to ignore (word padding).
 
         Returns:
-            Attended output: [seq_q, B, D]
+            Attended output: [S_q, B, D]
         """
         attn_output, _ = self.cross_attn(
             query=query, key=key, value=value,
@@ -77,34 +90,39 @@ class CrossModalAttention(nn.Module):
 
 class DualPathCrossAttention(nn.Module):
     """
-    Dual-path cross-attention with explicit alignment and incongruity modelling.
+    Dual-path word-to-patch cross-attention with explicit alignment and
+    incongruity modelling.
 
     Architecture:
         ┌─────────────────────┐
-        │   Alignment Branch  │ → learns where text and image AGREE
+        │   Alignment Branch  │ → learns where words and patches AGREE
         │  (standard X-attn)  │
         └─────────┬───────────┘
                   │
-        query ────┤
+        words ────┤  (or patches, depending on direction)
                   │
         ┌─────────┴───────────┐
-        │  Incongruity Branch │ → learns where text and image CONFLICT
-        │  (inverted X-attn)  │
+        │  Incongruity Branch │ → learns where words and patches CONFLICT
+        │  (separate subspace)│
         └─────────┬───────────┘
                   │
-        output = align_out + λ · incon_out
+        output = gate · align_out + (1 - gate) · λ · incon_out
+
+    Example: For a sentence ["they", "taking", "over"], the alignment branch
+    learns that "they" → face patches, while the incongruity branch detects
+    that "taking over" conflicts with benign image content (e.g., a family photo).
 
     The incongruity branch uses a separate set of projection weights
     and is trained with an auxiliary **decorrelation loss** that minimizes
-    cosine similarity between the query and attended output, forcing it
-    to focus on mismatched/conflicting regions.
+    correlation between branches, forcing the incongruity branch to focus
+    on mismatched/conflicting word-patch pairs.
 
     This is the key architectural novelty: explicitly modelling humor/hate
-    as contrast between modalities, not just similarity.
+    as contrast between words and patches, not just similarity.
 
     Args:
-        embed_dim:  Dimension of input embeddings.
-        num_heads:  Number of attention heads in each branch.
+        embed_dim:  Dimension of input embeddings (128 after projection).
+        num_heads:  Number of attention heads in each branch (8, per-head dim = 16).
         dropout:    Dropout probability.
         lambda_init: Initial value for the incongruity weighting factor λ.
     """
@@ -168,27 +186,27 @@ class DualPathCrossAttention(nn.Module):
         Dual-path forward pass.
 
         Args:
-            query: [seq_q, B, D]
-            key:   [seq_kv, B, D]
-            value: [seq_kv, B, D]
-            key_padding_mask: [B, seq_kv] — True for positions to ignore.
+            query: [S_q, B, D] — word embeddings (words→patches) or patch embeddings (patches→words)
+            key:   [S_kv, B, D] — patch embeddings (words→patches) or word embeddings (patches→words)
+            value: [S_kv, B, D] — same as key
+            key_padding_mask: [B, S_kv] — True for positions to ignore (word padding).
 
         Returns:
-            output:      [seq_q, B, D]  — Fused alignment + incongruity
-            align_out:   [seq_q, B, D]  — Alignment branch output (for loss)
-            incon_out:   [seq_q, B, D]  — Incongruity branch output (for loss)
+            output:      [S_q, B, D]  — Fused alignment + incongruity
+            align_out:   [S_q, B, D]  — Alignment branch output (for loss)
+            incon_out:   [S_q, B, D]  — Incongruity branch output (for loss)
         """
-        # ── Alignment branch: standard cross-attention ─────────────────
+        # ── Alignment branch: standard word-to-patch cross-attention ───
         align_attn_out, _ = self.align_attn(
             query=query, key=key, value=value,
             key_padding_mask=key_padding_mask,
         )
         align_out = self.align_norm(query + self.align_dropout(align_attn_out))
 
-        # ── Incongruity branch: cross-attention in a different subspace ─
+        # ── Incongruity branch: word-to-patch attention in a different subspace
         # NOTE: NO residual connection here — forces the branch to learn
-        # genuinely different (contrastive) representations instead of
-        # collapsing to ≈ query via the skip connection.
+        # genuinely different (contrastive) word-patch representations instead
+        # of collapsing to ≈ query via the skip connection.
         incon_query = self.incon_query_proj(query)
         incon_key = self.incon_key_proj(key)
         incon_val = self.incon_val_proj(value)
@@ -218,15 +236,13 @@ def compute_incongruity_loss(
     Barlow-Twins-style decorrelation loss to enforce dual-path separation.
 
     Computes the cross-covariance matrix between the alignment and
-    incongruity branch outputs, then penalizes off-diagonal elements
-    (redundancy) while encouraging on-diagonal elements to be zero
-    (decorrelation). This provides much stronger gradient signal than
-    cosine similarity, which was trivially satisfied by residual connections.
+    incongruity branch outputs (over words or patches), then penalizes
+    all correlations to enforce branch orthogonality.
 
     Args:
-        align_out: [S, B, D] — alignment branch output
-        incon_out: [S, B, D] — incongruity branch output
-        query:     [S, B, D] — original query input (unused, kept for API compat)
+        align_out: [S, B, D] — alignment branch output (words or patches)
+        incon_out: [S, B, D] — incongruity branch output (words or patches)
+        query:     [S, B, D] — original query (unused, kept for API compat)
 
     Returns:
         Scalar loss value.

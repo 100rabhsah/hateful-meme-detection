@@ -61,6 +61,8 @@ class Trainer:
         self.val_history: List[EpochMetrics] = []
         self.best_val_f1 = 0.0
         self.best_epoch = 0
+        self._prev_val_loss = float('inf')
+        self._prev_val_acc = 0.0
 
     def train(self) -> Dict[str, List[EpochMetrics]]:
         """
@@ -88,6 +90,18 @@ class Trainer:
             # ── Validate ────────────────────────────────────────────────
             val_metrics = self._validate(epoch, num_epochs)
             self.val_history.append(val_metrics)
+
+            # ── Training dynamics: trend arrows ─────────────────────────
+            loss_arrow = "↓" if val_metrics.loss < self._prev_val_loss else "↑"
+            acc_arrow = "↑" if val_metrics.accuracy > self._prev_val_acc else "↓"
+            f1_arrow = "↑" if val_metrics.f1 > (self.val_history[-2].f1 if len(self.val_history) > 1 else 0) else "↓"
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f"   📊 Val Loss: {val_metrics.loss:.4f} {loss_arrow}  |  "
+                  f"Val Acc: {val_metrics.accuracy:.4f} {acc_arrow}  |  "
+                  f"Val F1: {val_metrics.f1:.4f} {f1_arrow}  |  "
+                  f"LR: {current_lr:.2e}")
+            self._prev_val_loss = val_metrics.loss
+            self._prev_val_acc = val_metrics.accuracy
 
             # ── LR scheduler step ───────────────────────────────────────
             if self.scheduler is not None:
