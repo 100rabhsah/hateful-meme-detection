@@ -52,9 +52,10 @@ import time
 #   6   │ dual-path   │ balanced   │ partial  │ Dual-path on balanced data
 #   7   │ dual-path   │ augmented  │ partial  │ Dual-path + 5-fold CV
 #   8   │ word-patch  │ balanced   │ partial  │ Word-patch on balanced
+#   9   │ dual-path   │ augmented  │ none     │ Dual-path + fully unfreeze + 5-fold CV
 #
 
-EXPERIMENT_ID = 1   # ← CHANGE THIS (1–8)
+EXPERIMENT_ID = 1   # ← CHANGE THIS (1–9)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -300,6 +301,7 @@ EXPERIMENTS = {
     6: {"name": "v3_dual_bal_partial",  "mode": "dual-path",  "augmented": False, "dual_path": True,  "freeze": "partial",  "kfold": 0},
     7: {"name": "v3_dual_aug_kf5",     "mode": "dual-path",  "augmented": True,  "dual_path": True,  "freeze": "partial",  "kfold": 5},
     8: {"name": "v3_wp_bal_partial",    "mode": "word-patch", "augmented": False, "dual_path": False, "freeze": "partial",  "kfold": 0},
+    9: {"name": "v3_dual_aug_none_kf5", "mode": "dual-path",  "augmented": True,  "dual_path": True,  "freeze": "none",     "kfold": 5},
 }
 
 exp = EXPERIMENTS[EXPERIMENT_ID]
