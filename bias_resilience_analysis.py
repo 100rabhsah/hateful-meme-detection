@@ -323,7 +323,61 @@ if ckpt_path:
         )
         MODEL = HatefulMemesClassifier(model_config)
         ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-        MODEL.load_state_dict(ckpt["model_state_dict"])
+        saved_state = ckpt["model_state_dict"]
+
+        # ── Remap state_dict keys for transformers version compatibility ──
+        # Checkpoint may have been saved with a different transformers version.
+        # Old format: vit.encoder.layer.X.attention.attention.query.weight
+        # New format: vit.layers.X.attention.q_proj.weight
+        # We detect the mismatch and remap in whichever direction is needed.
+        model_keys = set(MODEL.state_dict().keys())
+        saved_keys = set(saved_state.keys())
+
+        # Check if remapping is needed (saved has old-style, model expects new-style or vice versa)
+        needs_remap = len(saved_keys - model_keys) > 10  # More than 10 mismatched keys
+
+        if needs_remap:
+            print("  🔄 Remapping checkpoint keys for transformers version compatibility...")
+            remapped_state = {}
+            remap_count = 0
+
+            # Build remapping rules (old → new and new → old)
+            VIT_KEY_MAP = {
+                # Old transformers → New transformers
+                "vit.encoder.layer.": "vit.layers.",
+                ".attention.attention.query.": ".attention.q_proj.",
+                ".attention.attention.key.": ".attention.k_proj.",
+                ".attention.attention.value.": ".attention.v_proj.",
+                ".attention.output.dense.": ".attention.o_proj.",
+                ".intermediate.dense.": ".mlp.fc1.",
+                ".output.dense.": ".mlp.fc2.",
+            }
+
+            for key, value in saved_state.items():
+                new_key = key
+                if key not in model_keys:
+                    # Try forward mapping (old → new)
+                    for old_pat, new_pat in VIT_KEY_MAP.items():
+                        new_key = new_key.replace(old_pat, new_pat)
+
+                    # If still not matching, try reverse mapping (new → old)
+                    if new_key not in model_keys:
+                        new_key = key
+                        for old_pat, new_pat in VIT_KEY_MAP.items():
+                            new_key = new_key.replace(new_pat, old_pat)
+
+                if new_key in model_keys:
+                    remapped_state[new_key] = value
+                    if new_key != key:
+                        remap_count += 1
+                else:
+                    remapped_state[new_key] = value  # Keep as-is, strict=False will handle
+
+            print(f"  ✅ Remapped {remap_count} keys")
+            MODEL.load_state_dict(remapped_state, strict=False)
+        else:
+            MODEL.load_state_dict(saved_state)
+
         MODEL.to(DEVICE)
         MODEL.eval()
         TOKENIZER = BertTokenizer.from_pretrained("bert-base-uncased")
@@ -335,6 +389,8 @@ if ckpt_path:
               + (f", val F1: {best_f1:.4f})" if isinstance(best_f1, float) else ")"))
     except Exception as e:
         print(f"  ⚠️  Failed to load model: {e}")
+        import traceback
+        traceback.print_exc()
         print(f"  📋 Running in TEXT-ONLY analysis mode")
         HAS_MODEL = False
 else:
